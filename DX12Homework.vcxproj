@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{0AC8EB4D-2441-4E1B-8E42-20AC2070F9F9}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <RootNamespace>DX12Homework</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>$(DefaultPlatformToolset)</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
+    <UseDebugLibraries>true</UseDebugLibraries>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <PreprocessorDefinitions>_DEBUG;WIN32;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <Optimization>Disabled</Optimization>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <PreprocessorDefinitions>NDEBUG;WIN32;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+    </ClCompile>
+    <Link>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="Gbuffer.cpp" />
+    <ClCompile Include="main.cpp" />
+    <ClCompile Include="RenderingSystem.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Shaders.hlsl">
+      <!-- Шейдер мы компилируем сами в коде (D3DCompileFromFile),
+           поэтому говорим Visual Studio не компилировать его как .hlsl проект-файл -->
+      <FileType>HLSL</FileType>
+      <ExcludedFromBuild>true</ExcludedFromBuild>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="obj\model.obj" />
+    <None Include="obj\model.mtl" />
+    <None Include="obj\checker.png" />
+  </ItemGroup>
+  <!-- После сборки копируем Shaders.hlsl и папку obj рядом с exe-файлом,
+       чтобы программа могла их найти во время запуска -->
+  <ItemGroup>
+    <ClInclude Include="Gbuffer.h" />
+    <ClInclude Include="RenderingSystem.h" />
+  </ItemGroup>
+  <Target Name="CopyAssets" AfterTargets="Build">
+    <Copy SourceFiles="Shaders.hlsl" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+    <ItemGroup>
+      <ObjFiles Include="obj\**\*.*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(ObjFiles)" DestinationFolder="$(OutDir)obj\%(RecursiveDir)" SkipUnchangedFiles="true" />
+  </Target>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>
