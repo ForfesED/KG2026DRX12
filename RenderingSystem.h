@@ -1,11 +1,9 @@
-// =====================================================================================
 // RenderingSystem.h
 // Класс, который отвечает за весь deferred rendering:
-//  - geometry pass (заполнение G-буфера)
-//  - lighting pass (накопление освещения от источников света через full-screen quad)
+//  geometry pass - заполнение G-буфера, геометрия идёт через тесселяцию (VS -> HS -> DS -> PS)
+//  lighting pass - накопление освещения от источников света через full-screen треугольник
 //
-// Источники света трёх типов (как требуется в домашке): Directional, Point, Spot.
-// =====================================================================================
+// Источники света трёх типов: Directional, Point, Spot.
 
 #pragma once
 
@@ -18,7 +16,7 @@
 using namespace DirectX;
 using Microsoft::WRL::ComPtr;
 
-// Типы источников света - должны совпадать со значениями LightType в шейдере
+// Типы источников света, должны совпадать со значениями LIGHT_* в шейдере
 enum class LightType : int
 {
     Directional = 0,
@@ -26,15 +24,14 @@ enum class LightType : int
     Spot = 2
 };
 
-// Описание одного источника света. Раскладка должна совпадать со
-// структурой Light в Shaders.hlsl (см. ниже).
+// Описание одного источника света. Раскладка должна совпадать со структурой Light в Shaders.hlsl
 struct Light
 {
     XMFLOAT3 Position = { 0, 0, 0 };
     float    Range = 50.0f;
 
     XMFLOAT3 Direction = { 0, -1, 0 };
-    float    SpotPower = 16.0f; // насколько узкий конус у spot-света
+    float    SpotPower = 16.0f; // чем больше, тем уже конус прожектора
 
     XMFLOAT3 Color = { 1, 1, 1 };
     float    Intensity = 1.0f;
@@ -43,11 +40,11 @@ struct Light
     XMFLOAT3 _pad = {};
 };
 
-// Константы для lighting pass (одна на каждый источник света)
+// Константы для lighting pass, одна копия на каждый источник света
 struct LightPassConstants
 {
-    XMFLOAT4X4 ViewProj;     // для восстановления / на будущее
-    XMFLOAT4X4 InvViewProj;  // пока не используем (мировые координаты уже лежат в G-буфере)
+    XMFLOAT4X4 ViewProj;
+    XMFLOAT4X4 InvViewProj;  // пока не используется, мировые координаты уже лежат в G-буфере
     XMFLOAT3   CameraPos;
     float      Pad0;
     Light      LightData;
@@ -56,22 +53,29 @@ struct LightPassConstants
 class RenderingSystem
 {
 public:
-    // создаёт GBuffer, root signature и PSO для geometry/lighting проходов
+    // создаёт GBuffer, root signature и PSO для geometry и lighting проходов
     void Init(ID3D12Device* device, UINT width, UINT height,
         ID3D12DescriptorHeap* srvHeap, UINT srvDescSize, UINT srvStartSlot,
         DXGI_FORMAT backBufferFormat, DXGI_FORMAT dsvFormat);
 
-    // -------- Geometry pass --------
-    // переключает render targets на G-buffer, очищает их, ставит PSO geometry pass
+    // Geometry pass.
+    // Переключает render targets на G-buffer, очищает их и ставит PSO с тесселяцией.
+    // Раскладка root signature:
+    //  0 - b0, константы объекта
+    //  1 - b1, константы кадра (камера и параметры тесселяции)
+    //  2 - таблица t0..t2: diffuse, normal map, displacement map
     void BeginGeometryPass(ID3D12GraphicsCommandList* cmdList, D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle);
     void EndGeometryPass(ID3D12GraphicsCommandList* cmdList);
 
     ID3D12RootSignature* GetGeometryRootSignature() const { return mGeometryRootSignature.Get(); }
     ID3D12PipelineState* GetGeometryPSO() const { return mGeometryPSO.Get(); }
 
-    // -------- Lighting pass --------
-    // рисует back buffer = накопление освещения от всех источников света
-    // через full-screen quad с additive blending (слайды 11, 13, 21, 22)
+    // каркасный режим, чтобы было видно, как меняется сетка после тесселяции
+    void SetWireframe(bool enabled) { mWireframe = enabled; }
+    bool IsWireframe() const { return mWireframe; }
+
+    // Lighting pass.
+    // Рисует в back buffer сумму освещения от всех источников через additive blending
     void RenderLights(ID3D12GraphicsCommandList* cmdList,
         D3D12_CPU_DESCRIPTOR_HANDLE backBufferRtv,
         const std::vector<Light>& lights,
@@ -80,7 +84,7 @@ public:
     GBuffer& GetGBuffer() { return mGBuffer; }
 
 private:
-    void CreateGeometryRootSignatureAndPSO(DXGI_FORMAT backBufferFormat, DXGI_FORMAT dsvFormat);
+    void CreateGeometryRootSignatureAndPSO(DXGI_FORMAT dsvFormat);
     void CreateLightingRootSignatureAndPSO(DXGI_FORMAT backBufferFormat);
 
 private:
@@ -89,16 +93,17 @@ private:
 
     GBuffer mGBuffer;
 
-    // geometry pass - переиспользует ту же root signature, что и раньше (b0/b1/t0),
-    // но PSO теперь пишет в 3 рендертаргета (MRT)
+    // geometry pass: обычный PSO и такой же, но в режиме каркаса
     ComPtr<ID3D12RootSignature> mGeometryRootSignature;
     ComPtr<ID3D12PipelineState> mGeometryPSO;
+    ComPtr<ID3D12PipelineState> mGeometryWireframePSO;
+    bool mWireframe = false;
 
-    // lighting pass - своя root signature: b0 (константы света/камеры) + t0..t2 (G-buffer SRV)
+    // lighting pass: своя root signature, b0 (константы света и камеры) + t0..t2 (G-buffer)
     ComPtr<ID3D12RootSignature> mLightingRootSignature;
-    ComPtr<ID3D12PipelineState> mLightingPSO;       // point/spot - additive
-    ComPtr<ID3D12PipelineState> mLightingPSOAmbientDir; // directional/ambient - тоже additive, но отдельный PSO под VS без позиции
+    ComPtr<ID3D12PipelineState> mLightingPSO;
 
+    // константный буфер под все источники света, по одному блоку на свет
     ComPtr<ID3D12Resource> mLightCB;
     BYTE* mLightCBData = nullptr;
     UINT mLightCBElementSize = 0;

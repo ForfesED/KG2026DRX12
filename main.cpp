@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <map>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -51,26 +52,43 @@ inline UINT CalcCBSize(UINT byteSize)
 }
 
 
-// Вершина нашей модели: позиция, нормаль (для света) и текстурные координаты
+// Вершина модели: позиция, нормаль, текстурные координаты и базис tangent space.
+// Tangent и Binormal вместе с нормалью задают оси, в которых записана карта нормалей.
 struct Vertex
 {
     XMFLOAT3 Pos;
     XMFLOAT3 Normal;
     XMFLOAT2 TexC;
+    XMFLOAT3 Tangent;
+    XMFLOAT3 Binormal;
+    XMFLOAT3 DispNormal; // направление сдвига при displacement, общее для всех копий вершины в этой точке
+    float    DispWeight; // 1 - вершину можно сдвигать, 0 - вершина на шве UV, сдвигать нельзя
 };
-
-// Это лежит в константном буфере b0 - данные на каждый объект (сабмеш)
+// Константный буфер b0 - данные на каждый объект (сабмеш)
 struct ObjectConstants
 {
     XMFLOAT4X4 World;
-    XMFLOAT4X4 TexTransform; // тут тайлинг + анимация текстуры
+    XMFLOAT4X4 TexTransform; // тайлинг и анимация текстуры
     XMFLOAT4   DiffuseAlbedo;
+    XMFLOAT4X4 ReliefTexTransform; // только тайлинг, для карт нормалей и высот
 };
 
-// Это лежит в константном буфере b1 - общие данные кадра (камера)
+// Константный буфер b1 - общие данные кадра.
+// Раскладка должна совпадать с cbPass в Shaders.hlsl, поля сгруппированы по 16 байт.
 struct PassConstants
 {
     XMFLOAT4X4 ViewProj;
+
+    XMFLOAT3 EyePosW;           // позиция камеры, по ней hull shader считает расстояние
+    float    TessMinDist;       // ближе этого расстояния тесселяция максимальная
+
+    float    TessMaxDist;       // дальше этого расстояния тесселяция минимальная
+    float    TessMinFactor;     // коэффициент тесселяции вдали
+    float    TessMaxFactor;     // коэффициент тесселяции вблизи
+    float    DisplacementScale; // высота смещения для белого пикселя displacement-карты
+
+    float    DisplacementBias;  // постоянная добавка к смещению
+    XMFLOAT3 Pad;
 };
 
 // Информация о материале, которую мы вытащили из .mtl файла
@@ -78,14 +96,18 @@ struct MaterialData
 {
     std::string Name;
     XMFLOAT4 DiffuseAlbedo = { 1.0f, 1.0f, 1.0f, 1.0f }; // цвет Kd
-    std::string DiffuseMapFile; // имя файла текстуры (map_Kd), может быть пустым
+    std::string DiffuseMapFile;      // текстура цвета (map_Kd), может быть пустой
+    std::string NormalMapFile;       // карта нормалей (norm, map_Kn или map_Bump с нормалями)
+    std::string DisplacementMapFile; // карта высот для тесселяции (disp, map_Disp или map_Bump с высотами)
 
     // Тайлинг и анимация - в обычном .mtl таких полей нет, поэтому
     // мы их просто выставляем в коде (см. функцию SetupMaterialAnimation)
     XMFLOAT2 TileScale = { 1.0f, 1.0f };
     XMFLOAT2 ScrollSpeed = { 0.0f, 0.0f };
 
-    int SrvIndex = 0; // индекс дескриптора текстуры в куче (0 = дефолтная белая текстура)
+    // Первый из трёх дескрипторов материала в SRV куче: diffuse, normal, displacement подряд.
+    // 0 - это тройка текстур по умолчанию (белая, плоская нормаль, чёрная)
+    int SrvIndex = 0;
 };
 
 // Один "кусок" модели, который рисуется одним вызовом DrawIndexed
@@ -99,7 +121,28 @@ struct Submesh
 
 
 
-// маленький помощник - грузит .mtl файл и возвращает список материалов
+// маленький помощник - грузит .mtl файл и возвращает список материалов + теперь читает карту высот и нормалей
+// переводит строку в нижний регистр, в .mtl ключевые слова пишут кто как хочет (map_Kd, map_kd, MAP_KD)
+static std::string ToLower(std::string str)
+{
+    for (char& c : str)
+        c = (char)tolower((unsigned char)c);
+    return str;
+}
+
+// map_Bump в разных моделях означает разное: в одних это карта нормалей, в других карта высот.
+// Отличаем по имени файла - у карт нормалей обычно есть normal, nrm, ddn или суффикс _n
+static bool LooksLikeNormalMap(const std::string& fileName)
+{
+    std::string f = ToLower(fileName);
+    return f.find("normal") != std::string::npos ||
+        f.find("nrm") != std::string::npos ||
+        f.find("ddn") != std::string::npos ||
+        f.find("_norm") != std::string::npos ||
+        f.find("_n.") != std::string::npos;
+}
+
+// грузит .mtl файл и возвращает список материалов вместе с картами нормалей и высот
 std::vector<MaterialData> LoadMtl(const std::string& path)
 {
     std::vector<MaterialData> materials;
@@ -113,24 +156,59 @@ std::vector<MaterialData> LoadMtl(const std::string& path)
         std::istringstream ss(line);
         std::string token;
         ss >> token;
+        std::string key = ToLower(token);
 
-        if (token == "newmtl")
+        // имя файла берём последним словом строки, т.к. перед ним могут стоять опции вроде "-bm 1.0"
+        auto ReadFileName = [&ss]() -> std::string
+            {
+                std::string word, last;
+                while (ss >> word)
+                    last = word;
+                return last;
+            };
+
+        if (key == "newmtl")
         {
             MaterialData m;
             ss >> m.Name;
             materials.push_back(m);
         }
-        else if (token == "Kd" && !materials.empty())
+        else if (materials.empty())
+        {
+            // пока не встретили ни одного newmtl, остальные строки относить некуда
+            continue;
+        }
+        else if (key == "kd")
         {
             float r, g, b;
             ss >> r >> g >> b;
             materials.back().DiffuseAlbedo = XMFLOAT4(r, g, b, 1.0f);
         }
-        else if (token == "map_Kd" && !materials.empty())
+        else if (key == "map_kd")
         {
-            std::string texName;
-            ss >> texName;
-            materials.back().DiffuseMapFile = texName;
+            materials.back().DiffuseMapFile = ReadFileName();
+        }
+        else if (key == "norm" || key == "map_kn" || key == "map_normal")
+        {
+            materials.back().NormalMapFile = ReadFileName();
+        }
+        else if (key == "disp" || key == "map_disp")
+        {
+            materials.back().DisplacementMapFile = ReadFileName();
+        }
+        else if (key == "map_bump" || key == "bump")
+        {
+            // не перезаписываем то, что уже задано явными norm/disp
+            std::string fileName = ReadFileName();
+            MaterialData& m = materials.back();
+            if (LooksLikeNormalMap(fileName))
+            {
+                if (m.NormalMapFile.empty()) m.NormalMapFile = fileName;
+            }
+            else
+            {
+                if (m.DisplacementMapFile.empty()) m.DisplacementMapFile = fileName;
+            }
         }
     }
     return materials;
@@ -199,7 +277,7 @@ LoadedModel LoadObjModel(const std::string& folder, const std::string& objFileNa
             }
         }
 
-        Vertex v;
+        Vertex v = {};
         // индексы в obj начинаются с 1, поэтому -1
         v.Pos = (posIdx > 0) ? positions[posIdx - 1] : XMFLOAT3(0, 0, 0);
         v.TexC = (texIdx > 0) ? texcoords[texIdx - 1] : XMFLOAT2(0, 0);
@@ -306,6 +384,156 @@ LoadedModel LoadObjModel(const std::string& folder, const std::string& objFileNa
     return model;
 }
 
+// Считает Tangent и Binormal для каждой вершины.
+// Для треугольника p0 p1 p2 с UV uv0 uv1 uv2 рёбра выражаются через T и B:
+//   edge1 = du1 * T + dv1 * B
+//   edge2 = du2 * T + dv2 * B
+// Это система 2x2, решаем её через обратную матрицу (f = 1 / определитель).
+// Вершина может входить в несколько треугольников, поэтому векторы копим суммой,
+// а в конце нормализуем и делаем T перпендикулярным нормали.
+void ComputeTangents(LoadedModel& model)// расчёт тангентов
+{
+    const size_t vertexCount = model.Vertices.size();
+    std::vector<XMVECTOR> tangents(vertexCount, XMVectorZero());
+    std::vector<XMVECTOR> binormals(vertexCount, XMVectorZero());
+
+    for (size_t i = 0; i + 2 < model.Indices.size(); i += 3)
+    {
+        uint32_t i0 = model.Indices[i];
+        uint32_t i1 = model.Indices[i + 1];
+        uint32_t i2 = model.Indices[i + 2];
+
+        const Vertex& v0 = model.Vertices[i0];
+        const Vertex& v1 = model.Vertices[i1];
+        const Vertex& v2 = model.Vertices[i2];
+
+        XMVECTOR p0 = XMLoadFloat3(&v0.Pos);
+        XMVECTOR edge1 = XMVectorSubtract(XMLoadFloat3(&v1.Pos), p0);
+        XMVECTOR edge2 = XMVectorSubtract(XMLoadFloat3(&v2.Pos), p0);
+
+        float du1 = v1.TexC.x - v0.TexC.x;
+        float dv1 = v1.TexC.y - v0.TexC.y;
+        float du2 = v2.TexC.x - v0.TexC.x;
+        float dv2 = v2.TexC.y - v0.TexC.y;
+
+        // если UV у треугольника вырождены (все в одной точке или на одной линии), решения нет
+        float det = du1 * dv2 - du2 * dv1;
+        if (fabsf(det) < 1e-12f)
+            continue;
+        float f = 1.0f / det;
+
+        // T = f * (dv2 * edge1 - dv1 * edge2)
+        XMVECTOR t = XMVectorScale(XMVectorSubtract(XMVectorScale(edge1, dv2), XMVectorScale(edge2, dv1)), f);
+        // B = f * (-du2 * edge1 + du1 * edge2)
+        XMVECTOR b = XMVectorScale(XMVectorSubtract(XMVectorScale(edge2, du1), XMVectorScale(edge1, du2)), f);
+
+        tangents[i0] = XMVectorAdd(tangents[i0], t);
+        tangents[i1] = XMVectorAdd(tangents[i1], t);
+        tangents[i2] = XMVectorAdd(tangents[i2], t);
+
+        binormals[i0] = XMVectorAdd(binormals[i0], b);
+        binormals[i1] = XMVectorAdd(binormals[i1], b);
+        binormals[i2] = XMVectorAdd(binormals[i2], b);
+    }
+
+    for (size_t i = 0; i < vertexCount; ++i)
+    {
+        Vertex& v = model.Vertices[i];
+        XMVECTOR n = XMVector3Normalize(XMLoadFloat3(&v.Normal));
+        XMVECTOR t = tangents[i];
+
+        // Грам-Шмидт: убираем из T проекцию на нормаль, чтобы T лежал в плоскости поверхности
+        t = XMVectorSubtract(t, XMVectorScale(n, XMVectorGetX(XMVector3Dot(n, t))));
+
+        // у вершины без нормальных UV тангента нет, берём любой вектор, перпендикулярный нормали
+        if (XMVectorGetX(XMVector3LengthSq(t)) < 1e-12f)
+        {
+            XMVECTOR helper = (fabsf(v.Normal.y) < 0.99f) ? XMVectorSet(0, 1, 0, 0) : XMVectorSet(1, 0, 0, 0);
+            t = XMVector3Cross(helper, n);
+        }
+        t = XMVector3Normalize(t);
+
+        // бинормаль достраиваем как перпендикуляр к N и T, а сторону берём от посчитанной по UV,
+        // так правильно обрабатываются зеркально развёрнутые UV
+        XMVECTOR b = XMVector3Cross(n, t);
+        if (XMVectorGetX(XMVector3Dot(b, binormals[i])) < 0.0f)
+            b = XMVectorNegate(b);
+
+        XMStoreFloat3(&v.Tangent, t);
+        XMStoreFloat3(&v.Binormal, b);
+    }
+}
+// Готовит данные для displacement без разрывов.
+// В .obj одна и та же точка часто представлена несколькими вершинами:
+//  на острых рёбрах (угол колонны) у копий разные нормали,
+//  на швах развёртки у копий разные UV.
+// Если сдвигать каждую копию вдоль своей нормали и по своей высоте из текстуры,
+// копии разъезжаются и между гранями появляется щель.
+// Решение:
+//  все копии одной точки сдвигаем вдоль одной общей, усреднённой нормали
+//  если у копий разные UV (шов), высоты у них всё равно разные, поэтому такие вершины не сдвигаем вообще,
+//  а внутри треугольника сдвиг плавно нарастает от 0 на шве до полного
+void ComputeDisplacementData(LoadedModel& model)
+{
+    // ключ для группировки вершин по позиции
+    struct PosKey
+    {
+        float x, y, z;
+        bool operator<(const PosKey& o) const
+        {
+            if (x != o.x) return x < o.x;
+            if (y != o.y) return y < o.y;
+            return z < o.z;
+        }
+    };
+
+    // собираем индексы всех вершин, у которых совпадает позиция
+    std::map<PosKey, std::vector<uint32_t>> groups;
+    for (uint32_t i = 0; i < (uint32_t)model.Vertices.size(); ++i)
+    {
+        const XMFLOAT3& p = model.Vertices[i].Pos;
+        groups[{ p.x, p.y, p.z }].push_back(i);
+    }
+
+    for (auto& group : groups)
+    {
+        const std::vector<uint32_t>& ids = group.second;
+        const Vertex& first = model.Vertices[ids[0]];
+
+        // сумма нормалей всех копий и проверка, что UV у всех копий одинаковые
+        XMVECTOR sum = XMVectorZero();
+        bool sameUV = true;
+        for (uint32_t id : ids)
+        {
+            const Vertex& v = model.Vertices[id];
+            sum = XMVectorAdd(sum, XMLoadFloat3(&v.Normal));
+
+            if (fabsf(v.TexC.x - first.TexC.x) > 1e-5f || fabsf(v.TexC.y - first.TexC.y) > 1e-5f)
+                sameUV = false;
+        }
+
+        // если нормали копий смотрят в противоположные стороны, сумма почти нулевая, тогда берём нормаль первой копии
+        XMVECTOR avg = (XMVectorGetX(XMVector3LengthSq(sum)) > 1e-8f)
+            ? XMVector3Normalize(sum)
+            : XMVector3Normalize(XMLoadFloat3(&first.Normal));
+
+        for (uint32_t id : ids)
+        {
+            XMStoreFloat3(&model.Vertices[id].DispNormal, avg);
+            model.Vertices[id].DispWeight = sameUV ? 1.0f : 0.0f;
+        }
+    }
+}
+// Раскладка SRV кучи:
+//  0, 1, 2 - текстуры по умолчанию: белая (diffuse), плоская нормаль, чёрная (нулевое смещение)
+//  3 и дальше - по 3 дескриптора на каждый материал (diffuse, normal, displacement)
+//  последние 3 слота - G-buffer для lighting pass
+const UINT kSrvHeapSize = 1024;
+const UINT kGBufferSrvSlot = kSrvHeapSize - GBuffer::kNumRenderTargets;
+const int kWhiteTexSlot = 0;
+const int kFlatNormalTexSlot = 1;
+const int kBlackTexSlot = 2;
+const int kFirstMaterialSlot = 3;
 
 class App
 {
@@ -316,30 +544,35 @@ public:
     void Destroy();
 
 private:
-    // ---- базовая инициализация DX12 ----
+    // базовая инициализация DX12
     void CreateDeviceAndQueue();
     void CreateSwapChain(HWND hwnd);
     void CreateDescriptorHeaps();
     void CreateRenderTargets();
     void CreateDepthStencil();
-   // void CreateRootSignature();
-    void CreatePipelineState();
     void CreateCommandObjects();
     void CreateFence();
 
-    // ---- загрузка модели и текстур ----
+    // загрузка модели и текстур
     void LoadModelAndTextures();
-    void SetupMaterialAnimation(); // тут вручную выставляем тайлинг/скорость анимации
-    void SetupSceneLights(); // расставляем источники света по сцене (Point/Directional/Spot)
+    void SetupMaterialAnimation(); // тут вручную выставляем тайлинг и скорость анимации
+    void SetupSceneLights();       // расставляем источники света по сцене
     void UploadBufferData(const void* data, UINT64 size, ComPtr<ID3D12Resource>& outDefaultBuffer);
-    void CreateTextureFromWicFile(const std::wstring& filename, int srvSlot);
-    void CreateDefaultWhiteTexture(int srvSlot);
-    void CreateTextureResourceAndUpload(UINT width, UINT height, const BYTE* pixels, UINT srcRowPitch, int srvSlot);
+    bool CreateTextureFromWicFile(const std::wstring& filename, int srvSlot);
+    void CreateDefaultTextures();
+    ID3D12Resource* CreateTextureResourceAndUpload(UINT width, UINT height, const BYTE* pixels, UINT srcRowPitch, int srvSlot);
+    void CreateSrv(ID3D12Resource* texture, int srvSlot);
+    void LoadMaterialTexture(const std::string& fileName, int srvSlot, ID3D12Resource* fallback);
 
-    // ---- помощники ----
+    // управление камерой и переключатели с клавиатуры
+    void UpdateInput(float dt);
+
+    // помощники
     void FlushCommandQueue();
 
 private:
+    HWND mHwnd = nullptr;
+
     // основные объекты D3D12
     ComPtr<ID3D12Device> mDevice;
     ComPtr<ID3D12CommandQueue> mCommandQueue;
@@ -350,7 +583,7 @@ private:
     // кучи дескрипторов
     ComPtr<ID3D12DescriptorHeap> mRtvHeap;
     ComPtr<ID3D12DescriptorHeap> mDsvHeap;
-    ComPtr<ID3D12DescriptorHeap> mSrvHeap; // тут лежат SRV всех текстур
+    ComPtr<ID3D12DescriptorHeap> mSrvHeap; // тут лежат SRV всех текстур и G-буфера
     UINT mRtvDescSize = 0;
     UINT mDsvDescSize = 0;
     UINT mSrvDescSize = 0;
@@ -360,7 +593,7 @@ private:
     ComPtr<ID3D12Resource> mDepthStencilBuffer;
     UINT mCurrentBackBuffer = 0;
 
-    // синхронизация CPU/GPU (делаем максимально просто - флуш каждый кадр)
+    // синхронизация CPU и GPU (максимально просто - флуш каждый кадр)
     ComPtr<ID3D12Fence> mFence;
     UINT64 mFenceValue = 0;
     HANDLE mFenceEvent = nullptr;
@@ -368,15 +601,16 @@ private:
     // пайплайн (deferred rendering)
     RenderingSystem mRenderingSystem;
 
-    // источники света сцены (Point/Directional/Spot) - см. SetupSceneLights()
+    // источники света сцены
     std::vector<Light> mLights;
+
     // геометрия модели
     ComPtr<ID3D12Resource> mVertexBuffer;
     ComPtr<ID3D12Resource> mIndexBuffer;
     D3D12_VERTEX_BUFFER_VIEW mVbv = {};
     D3D12_INDEX_BUFFER_VIEW mIbv = {};
 
-    // загруженные данные модели/материалов
+    // загруженные данные модели и материалов
     LoadedModel mModel;
 
     // константные буферы (в Upload куче, замапленные на постоянку)
@@ -387,18 +621,43 @@ private:
     ComPtr<ID3D12Resource> mPassCB;
     BYTE* mPassCBData = nullptr;
 
-    // вспомогательные ресурсы для загрузки текстур (нужно держать живыми пока GPU не скопирует)
+    // вспомогательные ресурсы для загрузки (живут, пока GPU не скопирует данные)
     std::vector<ComPtr<ID3D12Resource>> mTextureUploadHeaps;
     std::vector<ComPtr<ID3D12Resource>> mTextures; // сами текстуры (default heap)
+
+    // текстуры по умолчанию, их SRV подставляются, если у материала нет своей карты
+    ID3D12Resource* mWhiteTexture = nullptr;
+    ID3D12Resource* mFlatNormalTexture = nullptr;
+    ID3D12Resource* mBlackTexture = nullptr;
 
     // таймер
     LARGE_INTEGER mFreq = {};
     LARGE_INTEGER mStartTime = {};
+    LARGE_INTEGER mLastTime = {};
 
     UINT mClientWidth = kClientWidth;
     UINT mClientHeight = kClientHeight;
 
-    XMFLOAT3 mCameraPos = { 0.0f, 150.0f, -500.0f }; // нужна lighting pass для specular
+    // камера: позиция и углы поворота (yaw - влево-вправо, pitch - вверх-вниз)
+    XMFLOAT3 mCameraPos = { 0.0f, 150.0f, -500.0f };
+    float mCameraYaw = 0.0f;   // 0 = смотрим вдоль +Z
+    float mCameraPitch = 0.0f;
+    XMFLOAT3 mCameraForward = { 0.0f, 0.0f, 1.0f };
+
+    // Параметры тесселяции и смещения. Числа подобраны под масштаб Sponza,
+    // для модели другого размера их нужно поменять
+    float mTessMinDist = 100.0f;      // ближе - максимальная детализация
+    float mTessMaxDist = 1500.0f;     // дальше - треугольники не делятся
+    float mTessMinFactor = 1.0f;
+    float mTessMaxFactor = 16.0f;
+    float mDisplacementScale = 2.5f;
+    float mDisplacementBias = 0.0f;
+
+    // переключатели с клавиатуры
+    bool mTessellationEnabled = true; // T
+    bool mWireframe = false;          // F
+    bool mPrevKeyT = false;           // состояние клавиш в прошлом кадре, чтобы ловить именно нажатие
+    bool mPrevKeyF = false;
 };
 
 
@@ -406,7 +665,8 @@ void App::Init(HWND hwnd)
 {
     QueryPerformanceFrequency(&mFreq);
     QueryPerformanceCounter(&mStartTime);
-
+    mLastTime = mStartTime;
+    mHwnd = hwnd;
     // WIC (загрузка картинок) требует COM
     ThrowIfFailed(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED), "CoInitializeEx");
 
@@ -420,7 +680,7 @@ void App::Init(HWND hwnd)
     LoadModelAndTextures();
 
     mRenderingSystem.Init(mDevice.Get(), mClientWidth, mClientHeight,
-        mSrvHeap.Get(), mSrvDescSize, /*srvStartSlot=*/60,
+        mSrvHeap.Get(), mSrvDescSize, kGBufferSrvSlot,
         DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_D24_UNORM_S8_UINT);
 
     SetupSceneLights();
@@ -509,9 +769,9 @@ void App::CreateDescriptorHeaps()
     ThrowIfFailed(mDevice->CreateDescriptorHeap(&dsvDesc, IID_PPV_ARGS(&mDsvHeap)), "CreateDescriptorHeap DSV");
     mDsvDescSize = mDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
 
-    // SRV куча - под текстуры. Берём с запасом 16 слотов, нам хватит на любую модельку из домашки
+    // SRV куча - под текстуры материалов (по 3 на материал) и G-buffer, раскладка описана у kSrvHeapSize
     D3D12_DESCRIPTOR_HEAP_DESC srvDesc = {};
-    srvDesc.NumDescriptors = 64; //Лимит тестур
+    srvDesc.NumDescriptors = kSrvHeapSize;
     srvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     srvDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE; // эта куча видна шейдерам
     ThrowIfFailed(mDevice->CreateDescriptorHeap(&srvDesc, IID_PPV_ARGS(&mSrvHeap)), "CreateDescriptorHeap SRV");
@@ -746,7 +1006,9 @@ void App::UploadBufferData(const void* data, UINT64 size, ComPtr<ID3D12Resource>
 // Достаём пиксели в формате RGBA8 и заливаем их в текстуру D3D12, как
 // показывали на слайдах с CreateTextureFromScratch.
 
-void App::CreateTextureResourceAndUpload(UINT width, UINT height, const BYTE* pixels, UINT srcRowPitch, int srvSlot)
+// Создаёт текстуру RGBA8 в default куче, заливает в неё пиксели и делает SRV в слот srvSlot.
+// Возвращает указатель на текстуру (владеет ей вектор mTextures)
+ID3D12Resource* App::CreateTextureResourceAndUpload(UINT width, UINT height, const BYTE* pixels, UINT srcRowPitch, int srvSlot)
 {
     D3D12_HEAP_PROPERTIES defaultHeapProps = {};
     defaultHeapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -756,7 +1018,7 @@ void App::CreateTextureResourceAndUpload(UINT width, UINT height, const BYTE* pi
     texDesc.Width = width;
     texDesc.Height = height;
     texDesc.DepthOrArraySize = 1;
-    texDesc.MipLevels = 1; // мипмапы не делаем, для домашки хватит и одного уровня
+    texDesc.MipLevels = 1; // мипмапы не делаем, одного уровня хватает
     texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     texDesc.SampleDesc.Count = 1;
     texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
@@ -790,7 +1052,7 @@ void App::CreateTextureResourceAndUpload(UINT width, UINT height, const BYTE* pi
         &uploadHeapProps, D3D12_HEAP_FLAG_NONE, &uploadDesc,
         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&uploadBuffer)), "CreateCommittedResource (texture upload)");
 
-    // копируем картинку построчно - у исходных пикселей и у GPU буфера может быть разный rowPitch
+    // копируем картинку построчно, у исходных пикселей и у GPU буфера может быть разный rowPitch
     BYTE* mapped = nullptr;
     ThrowIfFailed(uploadBuffer->Map(0, nullptr, (void**)&mapped), "Map texture upload buffer");
     for (UINT y = 0; y < height; ++y)
@@ -812,7 +1074,7 @@ void App::CreateTextureResourceAndUpload(UINT width, UINT height, const BYTE* pi
 
     mCommandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 
-    // переводим текстуру в состояние "можно читать из пиксельного шейдера"
+    // переводим текстуру в состояние "можно читать из шейдера"
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = texture.Get();
@@ -821,24 +1083,32 @@ void App::CreateTextureResourceAndUpload(UINT width, UINT height, const BYTE* pi
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     mCommandList->ResourceBarrier(1, &barrier);
 
-    // создаём SRV (Shader Resource View) для этой текстуры в нашей куче дескрипторов
+    // создаём SRV для этой текстуры в нашей куче дескрипторов
+    CreateSrv(texture.Get(), srvSlot);
+
+    // держим upload буфер и саму текстуру живыми, пока GPU не выполнит копирование
+    mTextureUploadHeaps.push_back(uploadBuffer);
+    mTextures.push_back(texture);
+    return texture.Get();
+}
+
+// Создаёт SRV для уже существующей текстуры в указанном слоте SRV кучи.
+// Так одну и ту же текстуру по умолчанию можно подставить в слоты многих материалов
+void App::CreateSrv(ID3D12Resource* texture, int srvSlot)
+{
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
     srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srvDesc.Format = texDesc.Format;
+    srvDesc.Format = texture->GetDesc().Format;
     srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srvDesc.Texture2D.MipLevels = 1;
 
     D3D12_CPU_DESCRIPTOR_HANDLE handle = mSrvHeap->GetCPUDescriptorHandleForHeapStart();
     handle.ptr += (SIZE_T)srvSlot * mSrvDescSize;
-    mDevice->CreateShaderResourceView(texture.Get(), &srvDesc, handle);
-
-    // держим upload буфер и саму текстуру живыми
-    mTextureUploadHeaps.push_back(uploadBuffer);
-    mTextures.push_back(texture);
+    mDevice->CreateShaderResourceView(texture, &srvDesc, handle);
 }
-
-// грузит файл картинки через WIC и создаёт из неё текстуру в указанный слот SRV кучи
-void App::CreateTextureFromWicFile(const std::wstring& filename, int srvSlot)
+// Грузит файл картинки через WIC и создаёт из неё текстуру в указанный слот SRV кучи.
+// Возвращает false, если файл не открылся, тогда слот нужно заполнить текстурой по умолчанию
+bool App::CreateTextureFromWicFile(const std::wstring& filename, int srvSlot)
 {
     ComPtr<IWICImagingFactory> wicFactory;
     ThrowIfFailed(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wicFactory)), "CoCreateInstance WICImagingFactory");
@@ -847,15 +1117,15 @@ void App::CreateTextureFromWicFile(const std::wstring& filename, int srvSlot)
     HRESULT hr = wicFactory->CreateDecoderFromFilename(filename.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &decoder);
     if (FAILED(hr))
     {
-        // если файл текстуры не нашёлся - не страшно, просто будет белый цвет (* цвет материала)
-        OutputDebugStringW((L"Не удалось открыть текстуру: " + filename + L" - использую белую текстуру\n").c_str());
-        return;
+        // файл не нашёлся или формат не поддерживается, вызывающий код подставит текстуру по умолчанию
+        OutputDebugStringW((L"Не удалось открыть текстуру: " + filename + L" - будет текстура по умолчанию\n").c_str());
+        return false;
     }
 
     ComPtr<IWICBitmapFrameDecode> frame;
     ThrowIfFailed(decoder->GetFrame(0, &frame), "WIC GetFrame");
 
-    // переводим картинку в формат RGBA8 - именно его мы и зальём в текстуру
+    // переводим картинку в формат RGBA8, именно его мы и зальём в текстуру
     ComPtr<IWICFormatConverter> converter;
     ThrowIfFailed(wicFactory->CreateFormatConverter(&converter), "CreateFormatConverter");
     ThrowIfFailed(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom), "WIC Converter Initialize");
@@ -868,14 +1138,40 @@ void App::CreateTextureFromWicFile(const std::wstring& filename, int srvSlot)
     ThrowIfFailed(converter->CopyPixels(nullptr, rowPitch, (UINT)pixels.size(), pixels.data()), "WIC CopyPixels");
 
     CreateTextureResourceAndUpload(width, height, pixels.data(), rowPitch, srvSlot);
+    return true;
 }
 
-// создаёт текстуру 1x1 белого цвета - используем для материалов без картинки (map_Kd),
-// тогда итоговый цвет будет просто = DiffuseAlbedo материала
-void App::CreateDefaultWhiteTexture(int srvSlot)
+// Создаёт три текстуры 1x1 для материалов, у которых нет своих карт:
+//  белая - diffuse, итоговый цвет будет просто DiffuseAlbedo материала
+//  (128,128,255) - плоская нормаль, после распаковки это (0,0,1), то есть нормаль вершины без изменений
+//  чёрная - displacement, высота 0, вершины никуда не сдвигаются
+// Они лежат в слотах 0, 1, 2 подряд, поэтому таблица, начатая со слота 0, сама по себе
+// является корректным "материалом по умолчанию"
+void App::CreateDefaultTextures()
 {
     BYTE whitePixel[4] = { 255, 255, 255, 255 };
-    CreateTextureResourceAndUpload(1, 1, whitePixel, 4, srvSlot);
+    BYTE flatNormalPixel[4] = { 128, 128, 255, 255 };
+    BYTE blackPixel[4] = { 0, 0, 0, 255 };
+
+    mWhiteTexture = CreateTextureResourceAndUpload(1, 1, whitePixel, 4, kWhiteTexSlot);
+    mFlatNormalTexture = CreateTextureResourceAndUpload(1, 1, flatNormalPixel, 4, kFlatNormalTexSlot);
+    mBlackTexture = CreateTextureResourceAndUpload(1, 1, blackPixel, 4, kBlackTexSlot);
+}
+
+// Грузит одну текстуру материала в слот srvSlot.
+// Если имя файла пустое или файл не открылся, в слот кладётся SRV текстуры fallback
+void App::LoadMaterialTexture(const std::string& fileName, int srvSlot, ID3D12Resource* fallback)
+{
+    if (!fileName.empty())
+    {
+        std::string fullPath = "obj\\" + fileName;
+        OutputDebugStringA(("Гружу: " + fullPath + "\n").c_str());
+        std::wstring wPath(fullPath.begin(), fullPath.end());
+
+        if (CreateTextureFromWicFile(wPath, srvSlot))
+            return;
+    }
+    CreateSrv(fallback, srvSlot);
 }
 // Тут мы вручную настраиваем тайлинг и анимацию для текстур по их названию материала.
 // Это и есть та часть домашки, где "Добавьте текстурную анимацию и тайлинг".
@@ -927,7 +1223,7 @@ void App::SetupSceneLights()
     p2.Intensity = 3.0f;
     mLights.push_back(p2);
 
-    // ---- Point light 3 (в глубине сцены) ----
+    // ---- Point light 3  ----
     Light p3;
     p3.Type = (int)LightType::Point;
     p3.Position = XMFLOAT3(0.0f, 300.0f, 800.0f);
@@ -957,7 +1253,10 @@ void App::LoadModelAndTextures()
 
     if (mModel.Vertices.empty())
         throw std::runtime_error("Модель пустая - проверь файл obj/model.obj");
-
+    // базис tangent space для карт нормалей считаем до заливки вершин на GPU
+    ComputeTangents(mModel);
+    // общая нормаль сдвига и вес для displacement, чтобы грани не разъезжались
+    ComputeDisplacementData(mModel);
     // настраиваем тайлинг/анимацию текстур
     SetupMaterialAnimation();
     
@@ -975,28 +1274,25 @@ void App::LoadModelAndTextures()
 
     // ------ текстуры ------
     // слот 0 в SRV куче - всегда дефолтная белая текстура (для материалов без картинки)
-    CreateDefaultWhiteTexture(0);
-    int nextSrvSlot = 1;
+        // Текстуры.
+    // Слоты 0..2 - текстуры по умолчанию, дальше у каждого материала своя тройка
+    // diffuse, normal, displacement. Шейдер получает одну таблицу из трёх дескрипторов,
+    // начало которой и есть SrvIndex материала
+    CreateDefaultTextures();
+    int nextSrvSlot = kFirstMaterialSlot;
 
     for (auto& mat : mModel.Materials)
     {
-        if (!mat.DiffuseMapFile.empty())
-        {
-            // путь вида "obj/имя_файла.png"
-            std::string fullPath = "obj\\" + mat.DiffuseMapFile;
-            OutputDebugStringA(("Гружу: " + fullPath + "\n").c_str()); // добавь эту строку
-            std::wstring wPath(fullPath.begin(), fullPath.end());
+        if (nextSrvSlot + 3 > (int)kGBufferSrvSlot)
+            throw std::runtime_error("Материалов слишком много, увеличь kSrvHeapSize");
 
-            mat.SrvIndex = nextSrvSlot;
-            CreateTextureFromWicFile(wPath, nextSrvSlot);
-            nextSrvSlot++;
-        }
-        else
-        {
-            // нет текстуры в материале - используем дефолтную белую (слот 0)
-            mat.SrvIndex = 0;
-        }
+        mat.SrvIndex = nextSrvSlot;
+        LoadMaterialTexture(mat.DiffuseMapFile, nextSrvSlot + 0, mWhiteTexture);
+        LoadMaterialTexture(mat.NormalMapFile, nextSrvSlot + 1, mFlatNormalTexture);
+        LoadMaterialTexture(mat.DisplacementMapFile, nextSrvSlot + 2, mBlackTexture);
+        nextSrvSlot += 3;
     }
+ 
 
     // если в модели вообще нет материалов (например, .obj без mtllib) -
     // на всякий случай добьём список одним материалом по умолчанию
@@ -1038,28 +1334,105 @@ void App::LoadModelAndTextures()
         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&mPassCB)), "CreateCommittedResource PassCB");
     ThrowIfFailed(mPassCB->Map(0, nullptr, (void**)&mPassCBData), "Map PassCB");
 }
-// UPDATE - тут считаем камеру и обновляем константные буферы
+// Управление:
+//  WASD - движение, Q/E - вниз/вверх, Shift - быстрее
+//  стрелки - поворот камеры
+//  T - включить/выключить тесселяцию, F - каркасный режим
+void App::UpdateInput(float dt)
+{
+    // клавиши читаем только когда окно активно, иначе камера будет ездить при наборе текста в другом окне
+    if (GetForegroundWindow() != mHwnd)
+        return;
 
+    auto IsDown = [](int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; };
+
+    // поворот камеры
+    const float turnSpeed = 1.5f * dt; // радиан за кадр
+    if (IsDown(VK_LEFT))  mCameraYaw -= turnSpeed;
+    if (IsDown(VK_RIGHT)) mCameraYaw += turnSpeed;
+    if (IsDown(VK_UP))    mCameraPitch += turnSpeed;
+    if (IsDown(VK_DOWN))  mCameraPitch -= turnSpeed;
+
+    // не даём камере перевернуться через вертикаль
+    const float maxPitch = XM_PIDIV2 - 0.05f;
+    if (mCameraPitch > maxPitch)  mCameraPitch = maxPitch;
+    if (mCameraPitch < -maxPitch) mCameraPitch = -maxPitch;
+
+    // направление взгляда из углов (левая система координат, yaw = 0 смотрит вдоль +Z)
+    XMVECTOR forward = XMVectorSet(
+        sinf(mCameraYaw) * cosf(mCameraPitch),
+        sinf(mCameraPitch),
+        cosf(mCameraYaw) * cosf(mCameraPitch), 0.0f);
+    XMVECTOR right = XMVectorSet(cosf(mCameraYaw), 0.0f, -sinf(mCameraYaw), 0.0f);
+    XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+    XMStoreFloat3(&mCameraForward, forward);
+
+    // движение камеры
+    float moveSpeed = 400.0f * dt;
+    if (IsDown(VK_SHIFT)) moveSpeed *= 3.0f;
+
+    XMVECTOR pos = XMLoadFloat3(&mCameraPos);
+    if (IsDown('W')) pos = XMVectorAdd(pos, XMVectorScale(forward, moveSpeed));
+    if (IsDown('S')) pos = XMVectorSubtract(pos, XMVectorScale(forward, moveSpeed));
+    if (IsDown('D')) pos = XMVectorAdd(pos, XMVectorScale(right, moveSpeed));
+    if (IsDown('A')) pos = XMVectorSubtract(pos, XMVectorScale(right, moveSpeed));
+    if (IsDown('E')) pos = XMVectorAdd(pos, XMVectorScale(up, moveSpeed));
+    if (IsDown('Q')) pos = XMVectorSubtract(pos, XMVectorScale(up, moveSpeed));
+    XMStoreFloat3(&mCameraPos, pos);
+
+    // переключатели срабатывают только в момент нажатия, а не пока клавиша зажата
+    bool keyT = IsDown('T');
+    if (keyT && !mPrevKeyT) mTessellationEnabled = !mTessellationEnabled;
+    mPrevKeyT = keyT;
+
+    bool keyF = IsDown('F');
+    if (keyF && !mPrevKeyF) mWireframe = !mWireframe;
+    mPrevKeyF = keyF;
+}
+
+// UPDATE - тут считаем камеру и обновляем константные буферы
 void App::Update()
 {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     float totalTime = (float)(now.QuadPart - mStartTime.QuadPart) / (float)mFreq.QuadPart;
 
-    // камера крутится вокруг модели по кругу, чтобы было видно объект со всех сторон
-    float radius = 5.0f;
-    float camX = sinf(totalTime * 0.5f) * radius;
-    float camZ = cosf(totalTime * 0.5f) * radius;
+    // время кадра, ограничиваем сверху, чтобы после паузы (перетаскивание окна) камера не улетела
+    float dt = (float)(now.QuadPart - mLastTime.QuadPart) / (float)mFreq.QuadPart;
+    mLastTime = now;
+    if (dt > 0.1f) dt = 0.1f;
 
-    XMVECTOR eyePos = XMVectorSet(mCameraPos.x, mCameraPos.y, mCameraPos.z, 1.0f);
-    XMVECTOR target = XMVectorSet(0.0f, 150.0f, 0.0f, 1.0f);
+    UpdateInput(dt);
+    mRenderingSystem.SetWireframe(mWireframe);
+
+    XMVECTOR eyePos = XMLoadFloat3(&mCameraPos);
+    XMVECTOR forward = XMLoadFloat3(&mCameraForward);
     XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
 
-    XMMATRIX view = XMMatrixLookAtLH(eyePos, target, up);
-    XMMATRIX proj = XMMatrixPerspectiveFovLH(XM_PIDIV4, (float)mClientWidth / (float)mClientHeight, 1.0f, 10000.0f);//дальность прорисовки
+    XMMATRIX view = XMMatrixLookToLH(eyePos, forward, up);
+    XMMATRIX proj = XMMatrixPerspectiveFovLH(XM_PIDIV4, (float)mClientWidth / (float)mClientHeight, 1.0f, 10000.0f); // дальность прорисовки
 
-    PassConstants passCB;
+    PassConstants passCB = {};
     XMStoreFloat4x4(&passCB.ViewProj, XMMatrixTranspose(view * proj));
+    passCB.EyePosW = mCameraPos;
+    passCB.TessMinDist = mTessMinDist;
+    passCB.TessMaxDist = mTessMaxDist;
+
+    if (mTessellationEnabled)
+    {
+        passCB.TessMinFactor = mTessMinFactor;
+        passCB.TessMaxFactor = mTessMaxFactor;
+        passCB.DisplacementScale = mDisplacementScale;
+        passCB.DisplacementBias = mDisplacementBias;
+    }
+    else
+    {
+        // коэффициент 1 - тесселятор отдаёт исходный треугольник как есть, смещения тоже нет
+        passCB.TessMinFactor = 1.0f;
+        passCB.TessMaxFactor = 1.0f;
+        passCB.DisplacementScale = 0.0f;
+        passCB.DisplacementBias = 0.0f;
+    }
     memcpy(mPassCBData, &passCB, sizeof(passCB));
 
     // для каждого сабмеша обновляем мировую матрицу и матрицу текстурного трансформа
@@ -1082,6 +1455,8 @@ void App::Update()
         XMMATRIX texTransform = tileScale * scroll;
         XMStoreFloat4x4(&objCB.TexTransform, XMMatrixTranspose(texTransform));
 
+        // рельеф берёт тот же тайлинг, но без сдвига, чтобы геометрия стояла на месте
+        XMStoreFloat4x4(&objCB.ReliefTexTransform, XMMatrixTranspose(tileScale));
         objCB.DiffuseAlbedo = mat.DiffuseAlbedo;
 
         memcpy(mObjectCBData + i * mObjectCBElementSize, &objCB, sizeof(objCB));
@@ -1118,7 +1493,7 @@ void App::Draw()
     // b1 - константы кадра (камера), общие для всех объектов
     mCommandList->SetGraphicsRootConstantBufferView(1, mPassCB->GetGPUVirtualAddress());
 
-    mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    // топологию (патчи из 3 точек) уже выставил BeginGeometryPass, тут только буферы
     mCommandList->IASetVertexBuffers(0, 1, &mVbv);
     mCommandList->IASetIndexBuffer(&mIbv);
 
