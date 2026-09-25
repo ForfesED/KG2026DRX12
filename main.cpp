@@ -555,12 +555,23 @@ AABB ComputeModelAABB(const LoadedModel& model)
     return box;
 }
 
+// Параметры камеры, общие для проекции и для расчёта каскадов теней
+const float kCameraFovY = XM_PIDIV4;
+const float kCameraNear = 1.0f;
+const float kCameraFar = 10000.0f;
+
+// Параметры каскадных теней
+const UINT kShadowMapSize = 2048;        // размер одной карты (одного каскада) в текселях
+const float kShadowDistance = 3000.0f;   // до какой глубины от камеры есть тени, дальше всё освещено
+const float kCascadeLambda = 0.8f;       // 0 - каскады равной длины, 1 - чисто логарифмическое деление
+
 // Раскладка SRV кучи:
 //  0, 1, 2 - текстуры по умолчанию: белая (diffuse), плоская нормаль, чёрная (нулевое смещение)
 //  3 и дальше - по 3 дескриптора на каждый материал (diffuse, normal, displacement)
 //  последние 3 слота - G-buffer для lighting pass
 const UINT kSrvHeapSize = 1024;
 const UINT kGBufferSrvSlot = kSrvHeapSize - GBuffer::kNumRenderTargets;
+const UINT kShadowMapSrvSlot = kGBufferSrvSlot - 1; // слот перед G-буфером - каскадная карта теней
 const int kWhiteTexSlot = 0;
 const int kFlatNormalTexSlot = 1;
 const int kBlackTexSlot = 2;
@@ -602,6 +613,9 @@ private:
     void CreateMassScene();                         // раскидывает кубы и строит по ним октодерево
     void UpdateCulling(const XMMATRIX& viewProj);   // собирает список видимых кубов на этот кадр
     void UpdateWindowTitle(float dt);               // выводит в заголовок окна статистику и FPS
+
+    // тени
+    void UpdateShadows(const XMMATRIX& view);       // пересчитывает каскады и список объектов для карты теней
 
     // помощники
     void FlushCommandQueue();
@@ -722,6 +736,13 @@ private:
     // счётчик FPS для заголовка окна
     UINT mFpsFrames = 0;
     float mFpsTimer = 0.0f;
+
+    // тени
+    std::vector<uint32_t> mShadowCasters; // копии, которые попали хотя бы в один каскад и рисуются в карту теней
+    bool mPcfEnabled = true;              // P - мягкий край тени (PCF) или жёсткий
+    bool mShowCascades = false;           // K - раскрасить пиксели по номеру каскада
+    bool mPrevKeyP = false;
+    bool mPrevKeyK = false;
 };
 
 
@@ -746,6 +767,7 @@ void App::Init(HWND hwnd)
 
     mRenderingSystem.Init(mDevice.Get(), mClientWidth, mClientHeight,
         mSrvHeap.Get(), mSrvDescSize, kGBufferSrvSlot,
+        kShadowMapSrvSlot, kShadowMapSize,
         DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_D24_UNORM_S8_UINT);
 
     SetupSceneLights();
@@ -1348,7 +1370,7 @@ void App::LoadModelAndTextures()
 
     for (auto& mat : mModel.Materials)
     {
-        if (nextSrvSlot + 3 > (int)kGBufferSrvSlot)
+        if (nextSrvSlot + 3 > (int)kShadowMapSrvSlot)
             throw std::runtime_error("Материалов слишком много, увеличь kSrvHeapSize");
 
         mat.SrvIndex = nextSrvSlot;
@@ -1518,6 +1540,61 @@ void App::UpdateCulling(const XMMATRIX& viewProj)
     mCullingTimeMs = 1000.0f * (float)(end.QuadPart - start.QuadPart) / (float)mFreq.QuadPart;
 }
 
+// Тени на этот кадр:
+//  находим направленный свет текущей сцены (солнце), тени отбрасывает только он
+//  пересчитываем каскады под текущее положение камеры
+//  в сцене с копиями выбираем объекты, которые попали хотя бы в один каскад
+void App::UpdateShadows(const XMMATRIX& view)
+{
+    const std::vector<Light>& lights = mMassScene ? mMassLights : mLights;
+
+    XMFLOAT3 sunDir(0.0f, -1.0f, 0.0f);
+    for (const Light& l : lights)
+    {
+        if (l.Type == (int)LightType::Directional)
+        {
+            sunDir = l.Direction;
+            break;
+        }
+    }
+
+    CascadedShadowMap& shadowMap = mRenderingSystem.GetShadowMap();
+    shadowMap.Update(view, kCameraFovY, (float)mClientWidth / (float)mClientHeight, kCameraNear,
+        kShadowDistance, kCascadeLambda, sunDir, mPcfEnabled, mShowCascades);
+
+    if (!mMassScene)
+        return;
+
+    // Отсечение для карты теней: каскад - это тоже камера (ортогональная), у неё тоже есть фрустум.
+    // Объект рисуем в карту, только если он попал хотя бы в один из них.
+    // Фрустум каскада уже растянут в сторону солнца, поэтому объекты, которые сами не видны камере,
+    // но отбрасывают тень в кадр, тоже сюда попадают
+    mShadowCasters.clear();
+
+    if (!mCullingEnabled)
+    {
+        for (uint32_t i = 0; i < kMassObjectCount; ++i)
+            mShadowCasters.push_back(i);
+        return;
+    }
+
+    Frustum cascadeFrustums[CascadedShadowMap::kCascadeCount];
+    for (UINT c = 0; c < CascadedShadowMap::kCascadeCount; ++c)
+        cascadeFrustums[c].FromViewProj(shadowMap.GetCascadeViewProj(c));
+
+    for (uint32_t i = 0; i < kMassObjectCount; ++i)
+    {
+        for (UINT c = 0; c < CascadedShadowMap::kCascadeCount; ++c)
+        {
+            if (cascadeFrustums[c].TestAABB(mMassBoxes[i]) != Frustum::Result::Outside)
+            {
+                mShadowCasters.push_back(i);
+                break;
+            }
+        }
+    }
+}
+
 // Два раза в секунду пишет в заголовок окна режим, число нарисованных объектов,
 // число проверок AABB, время отсечения и FPS
 void App::UpdateWindowTitle(float dt)
@@ -1534,14 +1611,15 @@ void App::UpdateWindowTitle(float dt)
     wchar_t title[512];
     if (!mMassScene)
     {
-        swprintf_s(title, L"Sponza | тесселяция %ls | FPS %.0f | V-Sync %ls | M - сцена с кубами",
-            mTessellationEnabled ? L"вкл" : L"выкл", fps, mVSync ? L"вкл" : L"выкл");
+        swprintf_s(title, L"Sponza | тесселяция %ls | тени: PCF %ls | FPS %.0f | V-Sync %ls | M - сцена с копиями",
+            mTessellationEnabled ? L"вкл" : L"выкл", mPcfEnabled ? L"вкл" : L"выкл", fps, mVSync ? L"вкл" : L"выкл");
     }
     else
     {
         const wchar_t* mode = !mCullingEnabled ? L"выкл" : (mUseOctree ? L"фрустум + октодерево" : L"фрустум, перебор");
-        swprintf_s(title, L"Кубы | отсечение: %ls | рисуется %zu из %u | проверок AABB %u | отсечение %.3f мс | FPS %.0f | V-Sync %ls",
-            mode, mVisibleObjects.size(), kMassObjectCount, mCullingStats.AabbTests, mCullingTimeMs, fps, mVSync ? L"вкл" : L"выкл");
+        swprintf_s(title, L"Копии Sponza | отсечение: %ls | рисуется %zu из %u | в тени %zu | проверок AABB %u | отсечение %.3f мс | PCF %ls | FPS %.0f | V-Sync %ls",
+            mode, mVisibleObjects.size(), kMassObjectCount, mShadowCasters.size(), mCullingStats.AabbTests, mCullingTimeMs,
+            mPcfEnabled ? L"вкл" : L"выкл", fps, mVSync ? L"вкл" : L"выкл");
     }
     SetWindowTextW(mHwnd, title);
 }
@@ -1550,6 +1628,8 @@ void App::UpdateWindowTitle(float dt)
 //  WASD - движение, Q/E - вниз/вверх, Shift - быстрее
 //  стрелки - поворот камеры
 //  T - включить/выключить тесселяцию, F - каркасный режим
+//  P - PCF вкл/выкл: мягкий край тени или ступеньки
+//  K - 	раскрасить каскады: красный, зелёный, синий, жёлтый
 void App::UpdateInput(float dt)
 {
     // клавиши читаем только когда окно активно, иначе камера будет ездить при наборе текста в другом окне
@@ -1622,6 +1702,17 @@ void App::UpdateInput(float dt)
     if (keyV && !mPrevKeyV) mVSync = !mVSync;
     mPrevKeyV = keyV;
 
+
+    // PCF вкл/выкл: мягкий или ступенчатый край тени
+    bool keyP = IsDown('P');
+    if (keyP && !mPrevKeyP) mPcfEnabled = !mPcfEnabled;
+    mPrevKeyP = keyP;
+
+    // раскраска каскадов вкл/выкл
+    bool keyK = IsDown('K');
+    if (keyK && !mPrevKeyK) mShowCascades = !mShowCascades;
+    mPrevKeyK = keyK;
+
 }
 
 // UPDATE - тут считаем камеру и обновляем константные буферы
@@ -1644,7 +1735,7 @@ void App::Update()
     XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
 
     XMMATRIX view = XMMatrixLookToLH(eyePos, forward, up);
-    XMMATRIX proj = XMMatrixPerspectiveFovLH(XM_PIDIV4, (float)mClientWidth / (float)mClientHeight, 1.0f, 10000.0f); // дальность прорисовки
+    XMMATRIX proj = XMMatrixPerspectiveFovLH(kCameraFovY, (float)mClientWidth / (float)mClientHeight, kCameraNear, kCameraFar);// дальность прорисовки
 
     PassConstants passCB = {};
     XMStoreFloat4x4(&passCB.ViewProj, XMMatrixTranspose(view * proj));
@@ -1702,6 +1793,9 @@ void App::Update()
     if (mMassScene)
         UpdateCulling(view * proj);
 
+    // каскады зависят от камеры, поэтому пересчитываются каждый кадр
+    UpdateShadows(view);
+
     UpdateWindowTitle(dt);
 }
 
@@ -1725,6 +1819,38 @@ void App::Draw()
     mCommandList->SetDescriptorHeaps(1, heaps);
 
     D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = mDsvHeap->GetCPUDescriptorHandleForHeapStart();
+
+
+    // Shadow pass: сцена с точки зрения солнца во все каскады карты теней.
+    // Текстуры не нужны, только позиции, поэтому модель рисуется целиком одним вызовом, без деления на сабмеши
+    mRenderingSystem.BeginShadowPass(mCommandList.Get());
+
+    mCommandList->IASetVertexBuffers(0, 1, &mVbv);
+    mCommandList->IASetIndexBuffer(&mIbv);
+    UINT modelIndexCount = (UINT)mModel.Indices.size();
+
+    if (mMassScene)
+    {
+        // только копии, которые попали хотя бы в один каскад
+        D3D12_GPU_VIRTUAL_ADDRESS cbStart = mMassObjectCB->GetGPUVirtualAddress();
+        for (uint32_t id : mShadowCasters)
+        {
+            mCommandList->SetGraphicsRootConstantBufferView(0, cbStart + (UINT64)id * mObjectCBElementSize);
+            mCommandList->DrawIndexedInstanced(modelIndexCount, 1, 0, 0, 0);
+        }
+    }
+    else
+    {
+        // у всех сабмешей Sponza одна и та же мировая матрица, берём константы первого
+        mCommandList->SetGraphicsRootConstantBufferView(0, mObjectCB->GetGPUVirtualAddress());
+        mCommandList->DrawIndexedInstanced(modelIndexCount, 1, 0, 0, 0);
+    }
+
+    mRenderingSystem.EndShadowPass(mCommandList.Get());
+
+    // shadow pass поменял viewport на размер карты теней, возвращаем размер окна
+    mCommandList->RSSetViewports(1, &viewport);
+    mCommandList->RSSetScissorRects(1, &scissor);
 
     // Geometry pass: заполняем G-buffer
     mRenderingSystem.BeginGeometryPass(mCommandList.Get(), dsvHandle);

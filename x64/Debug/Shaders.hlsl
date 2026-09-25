@@ -270,6 +270,67 @@ Gbuffer GeometryPS(DomainOut pin)
 }
 
 
+// SHADOW PASS
+// Рисует сцену с точки зрения солнца во все каскады карты теней сразу.
+// VS переводит вершину в мир, GS запускается 4 раза на каждый треугольник (по разу на каскад),
+// переводит его матрицей своего каскада и отправляет в свой слой текстуры-массива.
+// Пиксельного шейдера нет: нужна только глубина, её пишет сам растеризатор
+
+#define CASCADE_COUNT 4
+
+// Данные каскадов, общие для shadow pass и lighting pass (раскладка = CascadeConstants в ShadowMap.h)
+cbuffer cbCascades : register(b1)
+{
+    float4x4 gCascadeViewProj[CASCADE_COUNT]; // view * proj света для каждого каскада
+    float4 gCascadeDistances; // дальняя граница каждого каскада по глубине от камеры
+    float4x4 gCameraView; // view матрица камеры
+    float4 gShadowParams; // x - 1/размер карты, y - PCF, z - раскраска каскадов, w - размер карты
+};
+
+struct ShadowVSIn
+{
+    float3 PosL : POSITION;
+};
+
+struct ShadowGSIn
+{
+    float4 PosW : POSITION;
+};
+
+struct ShadowGSOut
+{
+    float4 PosH : SV_POSITION;
+    uint ArrayIndex : SV_RenderTargetArrayIndex; // в какой слой текстуры-массива пишется треугольник
+};
+
+// Вершинный шейдер shadow pass: только перевод в мировые координаты
+ShadowGSIn ShadowVS(ShadowVSIn vin)
+{
+    ShadowGSIn vout;
+    vout.PosW = mul(float4(vin.PosL, 1.0f), gWorld);
+    return vout;
+}
+
+// Geometry shader с инстансингом: [instance(4)] запускает его 4 раза на каждый треугольник,
+// номер запуска приходит в SV_GSInstanceID и совпадает с номером каскада.
+// Так вся сцена попадает во все 4 карты за один draw call на объект
+[instance(CASCADE_COUNT)]
+[maxvertexcount(3)]
+void ShadowGS(triangle ShadowGSIn tri[3],
+              in uint id : SV_GSInstanceID,
+              inout TriangleStream<ShadowGSOut> stream)
+{
+    [unroll]
+    for (int i = 0; i < 3; ++i)
+    {
+        ShadowGSOut gout;
+        gout.PosH = mul(float4(tri[i].PosW.xyz, 1.0f), gCascadeViewProj[id]);
+        gout.ArrayIndex = id;
+        stream.Append(gout);
+    }
+}
+
+
 // LIGHTING PASS
 
 // Типы источников света, должны совпадать с enum LightType в RenderingSystem.h
@@ -307,6 +368,15 @@ Texture2D<float4> gAlbedoTex : register(t0);
 Texture2D<float4> gWorldPosTex : register(t1);
 Texture2D<float4> gNormalTex : register(t2);
 
+// карта теней: 4 слоя глубины, по одному на каскад
+Texture2DArray<float> gShadowMap : register(t3);
+
+// Сэмплер сравнения: сам сравнивает переданную глубину с глубиной в карте (LESS_EQUAL)
+// и возвращает 1, если пиксель освещён, и 0, если в тени.
+// С линейной фильтрацией он сравнивает 4 соседних текселя и смешивает результаты,
+// поэтому даже одна выборка даёт немного сглаженный край
+SamplerComparisonState gShadowSampler : register(s1);
+
 struct LightingVSOut
 {
     float4 PosH : SV_POSITION;
@@ -322,6 +392,74 @@ LightingVSOut LightingVS(uint id : SV_VertexID)
     vout.TexC = tex;
     vout.PosH = float4(tex * float2(2, -2) + float2(-1, 1), 0, 1);
     return vout;
+}
+
+// Тень от направленного света: 1 - пиксель освещён, 0 - полностью в тени, между - полутень от PCF.
+// cascade возвращает номер каскада, из которого взята тень (-1, если пиксель дальше всех каскадов)
+float CalcShadowFactor(float3 worldPos, out int cascade)
+{
+    // Глубина пикселя в пространстве камеры. Границы каскадов тоже заданы в нём, поэтому сравнивать можно напрямую
+    float4 viewPos = mul(float4(worldPos, 1.0f), gCameraView);
+    float depthVal = abs(viewPos.z);
+
+    // дальше последнего каскада карты теней нет, такой пиксель считаем освещённым
+    if (depthVal >= gCascadeDistances[CASCADE_COUNT - 1])
+    {
+        cascade = -1;
+        return 1.0f;
+    }
+
+    // выбираем первый каскад, дальняя граница которого дальше пикселя
+    int layer = CASCADE_COUNT - 1;
+    for (int i = 0; i < CASCADE_COUNT; ++i)
+    {
+        if (depthVal < gCascadeDistances[i])
+        {
+            layer = i;
+            break;
+        }
+    }
+    cascade = layer;
+
+    // положение пикселя с точки зрения солнца в этом каскаде
+    float4 posLight = mul(float4(worldPos, 1.0f), gCascadeViewProj[layer]);
+    float3 ndc = posLight.xyz / posLight.w;
+
+    // из NDC [-1,1] в текстурные координаты [0,1], ось Y у текстуры направлена вниз
+    float2 uv = float2(ndc.x * 0.5f + 0.5f, -ndc.y * 0.5f + 0.5f);
+    float depth = ndc.z;
+
+    if (gShadowParams.y > 0.5f)
+    {
+        // PCF (Percentage Closer Filtering): сравниваем глубину не с одним текселем, а с сеткой 5x5 вокруг
+        // и усредняем результаты. На краю тени часть сравнений проходит, часть нет -
+        // получается плавный переход вместо ступенек.
+        // SampleCmpLevelZero - это SampleCmp без выбора мипа: внутри if и цикла производных нет
+        float texel = gShadowParams.x;
+        float sum = 0.0f;
+
+        [unroll]
+        for (int y = -2; y <= 2; ++y)
+        {
+            [unroll]
+            for (int x = -2; x <= 2; ++x)
+            {
+                float2 offset = float2(x, y) * texel;
+                sum += gShadowMap.SampleCmpLevelZero(gShadowSampler, float3(uv + offset, layer), depth);
+            }
+        }
+        return sum / 25.0f;
+    }
+    else
+    {
+        // без PCF: один тексель и жёсткое сравнение, край тени получается ступеньками
+        if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f)
+            return 1.0f;
+
+        int2 texCoord = int2(uv * gShadowParams.w);
+        float mapDepth = gShadowMap.Load(int4(texCoord, layer, 0));
+        return (depth <= mapDepth) ? 1.0f : 0.0f;
+    }
 }
 
 // Пиксельный шейдер освещения: читает G-buffer через Load по экранным координатам пикселя
@@ -354,7 +492,23 @@ float4 LightingPS(LightingVSOut pin) : SV_Target
         float3 halfVec = normalize(lightDir + toEye);
         float spec = pow(saturate(dot(normal, halfVec)), 16.0f) * specPower;
 
-        lighting = ambient + diffuse + spec * lightColor;
+        // тень гасит прямой свет (diffuse и блик), ambient остаётся - в тени не абсолютно чёрно
+        int cascade;
+        float shadow = CalcShadowFactor(worldPos, cascade);
+        lighting = ambient + (diffuse + spec * lightColor) * shadow;
+
+        // отладка: раскрашиваем пиксели по номеру каскада, чтобы было видно, где кончается каждый
+        if (gShadowParams.z > 0.5f && cascade >= 0)
+        {
+            static const float3 cascadeColors[CASCADE_COUNT] =
+            {
+                float3(1.0f, 0.4f, 0.4f),
+                float3(0.4f, 1.0f, 0.4f),
+                float3(0.4f, 0.4f, 1.0f),
+                float3(1.0f, 1.0f, 0.4f)
+            };
+            lighting *= cascadeColors[cascade];
+        }
     }
     else if (gLight.Type == LIGHT_POINT)
     {

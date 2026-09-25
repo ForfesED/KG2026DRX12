@@ -66,6 +66,7 @@
     <ClCompile Include="Gbuffer.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="RenderingSystem.cpp" />
+    <ClCompile Include="ShadowMap.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="Shaders.hlsl">
@@ -86,6 +87,7 @@
     <ClInclude Include="Culling.h" />
     <ClInclude Include="Gbuffer.h" />
     <ClInclude Include="RenderingSystem.h" />
+    <ClInclude Include="ShadowMap.h" />
   </ItemGroup>
   <Target Name="CopyAssets" AfterTargets="Build">
     <Copy SourceFiles="Shaders.hlsl" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />

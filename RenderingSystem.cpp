@@ -12,7 +12,7 @@ inline UINT CalcCBSize(UINT byteSize)
 }
 
 // Компилирует одну точку входа из Shaders.hlsl.
-// target - профиль шейдера: vs_5_0, hs_5_0, ds_5_0, ps_5_0.
+// target - профиль шейдера: vs_5_0, hs_5_0, ds_5_0, gs_5_0, ps_5_0.
 // Если компиляция упала, текст ошибки уходит в окно Output отладчика.
 static ComPtr<ID3DBlob> CompileShader(const char* entryPoint, const char* target)
 {
@@ -33,15 +33,18 @@ static ComPtr<ID3DBlob> CompileShader(const char* entryPoint, const char* target
 }
 
 void RenderingSystem::Init(ID3D12Device* device, UINT width, UINT height,
-    ID3D12DescriptorHeap* srvHeap, UINT srvDescSize, UINT srvStartSlot,
+    ID3D12DescriptorHeap* srvHeap, UINT srvDescSize, UINT gbufferSrvSlot,
+    UINT shadowSrvSlot, UINT shadowMapSize,
     DXGI_FORMAT backBufferFormat, DXGI_FORMAT dsvFormat)
 {
     mDevice = device;
     mWidth = width;
     mHeight = height;
 
-    mGBuffer.Init(device, width, height, srvHeap, srvDescSize, srvStartSlot);
+    mGBuffer.Init(device, width, height, srvHeap, srvDescSize, gbufferSrvSlot);
+    mShadowMap.Init(device, shadowMapSize, srvHeap, srvDescSize, shadowSrvSlot);
 
+    CreateShadowRootSignatureAndPSO();
     CreateGeometryRootSignatureAndPSO(dsvFormat);
     CreateLightingRootSignatureAndPSO(backBufferFormat);
 
@@ -68,6 +71,90 @@ void RenderingSystem::Init(ID3D12Device* device, UINT width, UINT height,
     // буфер в upload куче, держим его замапленным всё время работы программы
     if (FAILED(mLightCB->Map(0, nullptr, (void**)&mLightCBData)))
         throw std::runtime_error("RenderingSystem: Map LightCB failed");
+}
+
+// Root signature и PSO для shadow pass.
+// Стадии: VS (перевод в мир) и GS (размножение треугольника по 4 каскадам), пиксельного шейдера нет.
+// Рендертаргетов тоже нет - пишется только глубина в текстуру-массив
+void RenderingSystem::CreateShadowRootSignatureAndPSO()
+{
+    D3D12_ROOT_PARAMETER params[2] = {};
+
+    // b0 - константы объекта, нужна мировая матрица в вершинном шейдере
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[0].Descriptor.ShaderRegister = 0;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+
+    // b1 - матрицы каскадов, нужны в geometry shader
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[1].Descriptor.ShaderRegister = 1;
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_GEOMETRY;
+
+    D3D12_ROOT_SIGNATURE_DESC rsDesc = {};
+    rsDesc.NumParameters = 2;
+    rsDesc.pParameters = params;
+    rsDesc.NumStaticSamplers = 0;
+    // закрываем доступ стадиям, которые в этом проходе не участвуют
+    rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS;
+
+    ComPtr<ID3DBlob> serialized, errorBlob;
+    HRESULT hr = D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errorBlob);
+    if (FAILED(hr))
+    {
+        if (errorBlob) OutputDebugStringA((char*)errorBlob->GetBufferPointer());
+        throw std::runtime_error("RenderingSystem: D3D12SerializeRootSignature (shadow) failed");
+    }
+    if (FAILED(mDevice->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&mShadowRootSignature))))
+        throw std::runtime_error("RenderingSystem: CreateRootSignature (shadow) failed");
+
+    ComPtr<ID3DBlob> vsBlob = CompileShader("ShadowVS", "vs_5_0");
+    ComPtr<ID3DBlob> gsBlob = CompileShader("ShadowGS", "gs_5_0");
+
+    // из вершины нужна только позиция, остальные поля вершинного буфера пропускаются (шаг задаёт VBV)
+    D3D12_INPUT_ELEMENT_DESC inputLayout[] =
+    {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+    };
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
+    psoDesc.pRootSignature = mShadowRootSignature.Get();
+    psoDesc.VS = { vsBlob->GetBufferPointer(), vsBlob->GetBufferSize() };
+    psoDesc.GS = { gsBlob->GetBufferPointer(), gsBlob->GetBufferSize() };
+    psoDesc.PS = { nullptr, 0 }; // пиксельный шейдер не нужен, глубину пишет растеризатор
+    psoDesc.InputLayout = { inputLayout, 1 };
+
+    psoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    // Отсечение задних граней выключено: в Sponza есть одиночные плоскости (занавески, листья),
+    // которые смотрят от солнца задней стороной, но тень отбрасывать всё равно должны
+    psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    psoDesc.RasterizerState.FrontCounterClockwise = FALSE;
+    psoDesc.RasterizerState.DepthClipEnable = TRUE;
+
+    // Смещение глубины (depth bias): отодвигает записанную глубину от солнца,
+    // чтобы поверхность не затеняла сама себя из-за ограниченной точности карты ("shadow acne").
+    // Для буфера глубины float: Bias = DepthBias * 2^(exponent(max z) - 23) + SlopeScaledDepthBias * MaxDepthSlope.
+    // Вторая часть растёт с наклоном треугольника к солнцу - наклонным поверхностям нужно смещение больше.
+    // DepthBiasClamp ограничивает смещение сверху, чтобы под острым углом полигон не улетал слишком далеко
+    psoDesc.RasterizerState.DepthBias = 1000;
+    psoDesc.RasterizerState.SlopeScaledDepthBias = 1.5f;
+    psoDesc.RasterizerState.DepthBiasClamp = 0.01f;
+
+    psoDesc.DepthStencilState.DepthEnable = TRUE;
+    psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    psoDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    psoDesc.DepthStencilState.StencilEnable = FALSE;
+
+    psoDesc.SampleMask = UINT_MAX;
+    psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    psoDesc.NumRenderTargets = 0;                 // цветных рендертаргетов нет
+    psoDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;    // формат DSV карты теней
+    psoDesc.SampleDesc.Count = 1;
+
+    if (FAILED(mDevice->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&mShadowPSO))))
+        throw std::runtime_error("RenderingSystem: CreateGraphicsPipelineState (shadow) failed");
 }
 
 // Root signature и PSO для geometry pass с тесселяцией.
@@ -197,42 +284,76 @@ void RenderingSystem::CreateGeometryRootSignatureAndPSO(DXGI_FORMAT dsvFormat)
 }
 
 // Root signature и PSO для lighting pass.
-//  b0 - LightPassConstants (камера и один источник света)
-//  t0..t2 - G-buffer (Albedo, WorldPos, Normal)
+//  0 - b0, LightPassConstants (камера и один источник света)
+//  1 - t0..t2, G-buffer (Albedo, WorldPos, Normal)
+//  2 - b1, константы каскадов
+//  3 - t3, каскадная карта теней
 // Рисуется full-screen треугольник с additive blending
 void RenderingSystem::CreateLightingRootSignatureAndPSO(DXGI_FORMAT backBufferFormat)
 {
-    D3D12_DESCRIPTOR_RANGE srvRange = {};
-    srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    srvRange.NumDescriptors = GBuffer::kNumRenderTargets;
-    srvRange.BaseShaderRegister = 0;
+    D3D12_DESCRIPTOR_RANGE gbufferRange = {};
+    gbufferRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    gbufferRange.NumDescriptors = GBuffer::kNumRenderTargets;
+    gbufferRange.BaseShaderRegister = 0;
 
-    D3D12_ROOT_PARAMETER params[2] = {};
+    D3D12_DESCRIPTOR_RANGE shadowRange = {};
+    shadowRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    shadowRange.NumDescriptors = 1;
+    shadowRange.BaseShaderRegister = 3; // t3
+
+    D3D12_ROOT_PARAMETER params[4] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[1].DescriptorTable.NumDescriptorRanges = 1;
-    params[1].DescriptorTable.pDescriptorRanges = &srvRange;
+    params[1].DescriptorTable.pDescriptorRanges = &gbufferRange;
     params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-    // G-buffer читается через Load, сэмплер оставлен на случай, если понадобится Sample
-    D3D12_STATIC_SAMPLER_DESC sampler = {};
-    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-    sampler.MaxLOD = D3D12_FLOAT32_MAX;
-    sampler.ShaderRegister = 0;
-    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[2].Descriptor.ShaderRegister = 1;
+    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[3].DescriptorTable.NumDescriptorRanges = 1;
+    params[3].DescriptorTable.pDescriptorRanges = &shadowRange;
+    params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_STATIC_SAMPLER_DESC samplers[2] = {};
+
+    // s0 - обычный точечный сэмплер. G-buffer читается через Load, он оставлен на случай, если понадобится Sample
+    samplers[0].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    samplers[0].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    samplers[0].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    samplers[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    samplers[0].ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    samplers[0].MaxLOD = D3D12_FLOAT32_MAX;
+    samplers[0].ShaderRegister = 0;
+    samplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    // s1 - сэмплер сравнения для карты теней.
+    // COMPARISON_..._LINEAR: сравнивает 4 соседних текселя и смешивает результаты.
+    // LESS_EQUAL: 1, если глубина пикселя <= глубины в карте, то есть между пикселем и солнцем ничего нет.
+    // BORDER + белый цвет: за краем карты глубина = 1, значит там всё освещено
+    samplers[1].Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR;
+    samplers[1].AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    samplers[1].AddressV = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    samplers[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    samplers[1].MipLODBias = 0.0f;
+    samplers[1].MaxAnisotropy = 16;
+    samplers[1].ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    samplers[1].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+    samplers[1].MinLOD = 0.0f;
+    samplers[1].MaxLOD = D3D12_FLOAT32_MAX;
+    samplers[1].ShaderRegister = 1;
+    samplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_ROOT_SIGNATURE_DESC rsDesc = {};
-    rsDesc.NumParameters = 2;
+    rsDesc.NumParameters = 4;
     rsDesc.pParameters = params;
-    rsDesc.NumStaticSamplers = 1;
-    rsDesc.pStaticSamplers = &sampler;
+    rsDesc.NumStaticSamplers = 2;
+    rsDesc.pStaticSamplers = samplers;
     rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE; // input layout не нужен, треугольник строится в VS
 
     ComPtr<ID3DBlob> serialized, errorBlob;
@@ -285,6 +406,36 @@ void RenderingSystem::CreateLightingRootSignatureAndPSO(DXGI_FORMAT backBufferFo
         throw std::runtime_error("RenderingSystem: CreateGraphicsPipelineState (lighting) failed");
 }
 
+// Начало shadow pass: карта теней становится буфером глубины и очищается
+void RenderingSystem::BeginShadowPass(ID3D12GraphicsCommandList* cmdList)
+{
+    mShadowMap.TransitionTo(cmdList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    mShadowMap.Clear(cmdList);
+
+    // viewport размером с карту теней, а не с окно
+    cmdList->RSSetViewports(1, &mShadowMap.GetViewport());
+    cmdList->RSSetScissorRects(1, &mShadowMap.GetScissor());
+
+    // цветных рендертаргетов нет, только глубина
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv = mShadowMap.GetDsv();
+    cmdList->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+
+    cmdList->SetPipelineState(mShadowPSO.Get());
+    cmdList->SetGraphicsRootSignature(mShadowRootSignature.Get());
+
+    // матрицы каскадов одинаковые для всех объектов
+    cmdList->SetGraphicsRootConstantBufferView(1, mShadowMap.GetConstantsGpuAddress());
+
+    // тесселяции в этом проходе нет, обычные треугольники
+    cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+}
+
+// Конец shadow pass: карта теней снова доступна для чтения в lighting pass
+void RenderingSystem::EndShadowPass(ID3D12GraphicsCommandList* cmdList)
+{
+    mShadowMap.TransitionTo(cmdList, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+}
+
 // Начало geometry pass: G-buffer становится рендертаргетом и очищается
 void RenderingSystem::BeginGeometryPass(ID3D12GraphicsCommandList* cmdList, D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle)
 {
@@ -324,8 +475,10 @@ void RenderingSystem::RenderLights(ID3D12GraphicsCommandList* cmdList,
     cmdList->SetPipelineState(mLightingPSO.Get());
     cmdList->SetGraphicsRootSignature(mLightingRootSignature.Get());
 
-    // таблица SRV G-буфера одна и та же для всех источников света
+    // G-buffer, константы каскадов и карта теней одни и те же для всех источников света
     cmdList->SetGraphicsRootDescriptorTable(1, mGBuffer.GetSrvGpuHandle());
+    cmdList->SetGraphicsRootConstantBufferView(2, mShadowMap.GetConstantsGpuAddress());
+    cmdList->SetGraphicsRootDescriptorTable(3, mShadowMap.GetSrvGpuHandle());
 
     cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
