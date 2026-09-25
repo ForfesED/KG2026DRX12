@@ -62,6 +62,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="Culling.cpp" />
     <ClCompile Include="Gbuffer.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="RenderingSystem.cpp" />
@@ -82,6 +83,7 @@
   <!-- После сборки копируем Shaders.hlsl и папку obj рядом с exe-файлом,
        чтобы программа могла их найти во время запуска -->
   <ItemGroup>
+    <ClInclude Include="Culling.h" />
     <ClInclude Include="Gbuffer.h" />
     <ClInclude Include="RenderingSystem.h" />
   </ItemGroup>

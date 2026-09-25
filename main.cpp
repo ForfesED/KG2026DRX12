@@ -11,13 +11,17 @@
 #include <vector>
 #include <unordered_map>
 #include <map>
+#include <random>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <cmath>
+#include <cfloat>
 
 #include "Gbuffer.h"
 #include "RenderingSystem.h"
+#include "Culling.h"
+
 // тут подключаем нужные библиотеки, чтобы линкер не ругался
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -524,6 +528,33 @@ void ComputeDisplacementData(LoadedModel& model)
         }
     }
 }
+
+
+// Параметры сцены с кучей объектов.
+// Каждая копия - целая Sponza (~262 тысячи треугольников), поэтому копий сотни, а не тысячи
+const UINT kMassObjectCount = 200;        // сколько копий раскидать, если тормозит - уменьши
+const float kMassSceneHalfSize = 4000.0f; // копии разбросаны по X и Z от -4000 до 4000
+const float kMassSceneHeight = 1500.0f;   // и по Y от 0 до 1500
+
+// Считает AABB модели в её собственных координатах: минимум и максимум по всем вершинам
+AABB ComputeModelAABB(const LoadedModel& model)
+{
+    AABB box;
+    box.Min = XMFLOAT3(FLT_MAX, FLT_MAX, FLT_MAX);
+    box.Max = XMFLOAT3(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+
+    for (const Vertex& v : model.Vertices)
+    {
+        box.Min.x = fminf(box.Min.x, v.Pos.x);
+        box.Min.y = fminf(box.Min.y, v.Pos.y);
+        box.Min.z = fminf(box.Min.z, v.Pos.z);
+        box.Max.x = fmaxf(box.Max.x, v.Pos.x);
+        box.Max.y = fmaxf(box.Max.y, v.Pos.y);
+        box.Max.z = fmaxf(box.Max.z, v.Pos.z);
+    }
+    return box;
+}
+
 // Раскладка SRV кучи:
 //  0, 1, 2 - текстуры по умолчанию: белая (diffuse), плоская нормаль, чёрная (нулевое смещение)
 //  3 и дальше - по 3 дескриптора на каждый материал (diffuse, normal, displacement)
@@ -566,6 +597,11 @@ private:
 
     // управление камерой и переключатели с клавиатуры
     void UpdateInput(float dt);
+
+    // сцена с кучей объектов и отсечение
+    void CreateMassScene();                         // раскидывает кубы и строит по ним октодерево
+    void UpdateCulling(const XMMATRIX& viewProj);   // собирает список видимых кубов на этот кадр
+    void UpdateWindowTitle(float dt);               // выводит в заголовок окна статистику и FPS
 
     // помощники
     void FlushCommandQueue();
@@ -658,6 +694,34 @@ private:
     bool mWireframe = false;          // F
     bool mPrevKeyT = false;           // состояние клавиш в прошлом кадре, чтобы ловить именно нажатие
     bool mPrevKeyF = false;
+
+
+ 
+
+    ComPtr<ID3D12Resource> mMassObjectCB;  // константы всех кубов, заполняются один раз, кубы не двигаются
+    std::vector<AABB> mMassBoxes;          // ограничивающий объём каждого куба в мировых координатах
+    std::vector<Light> mMassLights;        // в сцене с кубами только солнце
+
+    // отсечение
+    Frustum mFrustum;
+    Octree mOctree;
+    std::vector<uint32_t> mVisibleObjects; // номера кубов, которые рисуем в этом кадре
+    CullingStats mCullingStats;
+    float mCullingTimeMs = 0.0f;           // сколько CPU потратил на отсечение в этом кадре
+
+    // переключатели
+    bool mMassScene = false;      // M - Sponza со светом или сцена с кубами
+    bool mCullingEnabled = true;  // C - frustum culling вкл/выкл
+    bool mUseOctree = true;       // O - отсечение через октодерево или полным перебором
+    bool mVSync = true;           // V - вертикальная синхронизация, без неё FPS не упирается в частоту монитора
+    bool mPrevKeyM = false;
+    bool mPrevKeyC = false;
+    bool mPrevKeyO = false;
+    bool mPrevKeyV = false;
+
+    // счётчик FPS для заголовка окна
+    UINT mFpsFrames = 0;
+    float mFpsTimer = 0.0f;
 };
 
 
@@ -678,6 +742,7 @@ void App::Init(HWND hwnd)
     CreateRenderTargets();
     CreateDepthStencil();
     LoadModelAndTextures();
+    CreateMassScene();
 
     mRenderingSystem.Init(mDevice.Get(), mClientWidth, mClientHeight,
         mSrvHeap.Get(), mSrvDescSize, kGBufferSrvSlot,
@@ -1334,6 +1399,153 @@ void App::LoadModelAndTextures()
         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&mPassCB)), "CreateCommittedResource PassCB");
     ThrowIfFailed(mPassCB->Map(0, nullptr, (void**)&mPassCBData), "Map PassCB");
 }
+
+// Сцена с кучей объектов: уменьшенные копии Sponza без текстур и без цвета,
+// разного размера и поворота, разбросанные случайно.
+// Копии неподвижные, поэтому их константы и октодерево строятся один раз при запуске.
+// Геометрия своя не нужна - рисуем тот же вершинный и индексный буфер, что и основная Sponza
+void App::CreateMassScene()
+{
+    // коробка вокруг Sponza в её собственных координатах, из неё для каждой копии получится мировой AABB
+    AABB localBox = ComputeModelAABB(mModel);
+
+    // константный буфер на все копии, по блоку на копию (каждый блок выровнен по 256 байт)
+    D3D12_HEAP_PROPERTIES uploadHeapProps = {};
+    uploadHeapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+    D3D12_RESOURCE_DESC cbDesc = {};
+    cbDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    cbDesc.Width = (UINT64)mObjectCBElementSize * kMassObjectCount;
+    cbDesc.Height = 1;
+    cbDesc.DepthOrArraySize = 1;
+    cbDesc.MipLevels = 1;
+    cbDesc.SampleDesc.Count = 1;
+    cbDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    ThrowIfFailed(mDevice->CreateCommittedResource(&uploadHeapProps, D3D12_HEAP_FLAG_NONE, &cbDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&mMassObjectCB)), "CreateCommittedResource MassObjectCB");
+
+    BYTE* cbData = nullptr;
+    ThrowIfFailed(mMassObjectCB->Map(0, nullptr, (void**)&cbData), "Map MassObjectCB");
+
+    // фиксированное зерно - при каждом запуске копии стоят на тех же местах, удобно сравнивать замеры
+    std::mt19937 rng(12345);
+    std::uniform_real_distribution<float> distXZ(-kMassSceneHalfSize, kMassSceneHalfSize);
+    std::uniform_real_distribution<float> distY(0.0f, kMassSceneHeight);
+    std::uniform_real_distribution<float> distScale(0.05f, 0.15f); // полная Sponza ~3700 единиц в длину, копии ~200-550
+    std::uniform_real_distribution<float> distAngle(0.0f, XM_2PI);
+
+    mMassBoxes.resize(kMassObjectCount);
+
+    for (UINT i = 0; i < kMassObjectCount; ++i)
+    {
+        // масштаб одинаковый по всем осям, поворот только вокруг вертикали - здания стоят ровно
+        float scale = distScale(rng);
+        XMMATRIX world =
+            XMMatrixScaling(scale, scale, scale) *
+            XMMatrixRotationY(distAngle(rng)) *
+            XMMatrixTranslation(distXZ(rng), distY(rng), distXZ(rng));
+
+        // мировой AABB копии
+        mMassBoxes[i] = TransformAABB(localBox, world);
+
+        // без текстур и без цвета: светло-серый альбедо, UV не трансформируются
+        ObjectConstants objCB = {};
+        XMStoreFloat4x4(&objCB.World, XMMatrixTranspose(world));
+        XMStoreFloat4x4(&objCB.TexTransform, XMMatrixIdentity());
+        XMStoreFloat4x4(&objCB.ReliefTexTransform, XMMatrixIdentity());
+        objCB.DiffuseAlbedo = XMFLOAT4(0.8f, 0.8f, 0.8f, 1.0f);
+
+        memcpy(cbData + (size_t)i * mObjectCBElementSize, &objCB, sizeof(objCB));
+    }
+
+    // данные больше не меняются, отображение можно снять, GPU читает upload-кучу напрямую
+    mMassObjectCB->Unmap(0, nullptr);
+
+    // октодерево строится один раз, т.к. объекты неподвижны
+    mOctree.Build(mMassBoxes);
+
+    char msg[128];
+    sprintf_s(msg, "Октодерево построено: %zu узлов на %u объектов\n", mOctree.GetNodeCount(), kMassObjectCount);
+    OutputDebugStringA(msg);
+
+    // свет для сцены с копиями - одно солнце, оно же даёт ambient
+    Light sun;
+    sun.Type = (int)LightType::Directional;
+    sun.Direction = XMFLOAT3(0.4f, -1.0f, 0.6f);
+    sun.Color = XMFLOAT3(1.0f, 1.0f, 1.0f);
+    sun.Intensity = 1.2f;
+    mMassLights.push_back(sun);
+}
+
+// Отсечение кубов на этот кадр. Три режима:
+//  выкл             - рисуем все кубы
+//  перебор          - проверяем AABB каждого куба против фрустума
+//  октодерево       - проверяем кубы узлов дерева, невидимые ветки отбрасываются целиком
+void App::UpdateCulling(const XMMATRIX& viewProj)
+{
+    LARGE_INTEGER start, end;
+    QueryPerformanceCounter(&start);
+
+    mVisibleObjects.clear();
+    mCullingStats = {};
+
+    if (!mCullingEnabled)
+    {
+        for (uint32_t i = 0; i < kMassObjectCount; ++i)
+            mVisibleObjects.push_back(i);
+    }
+    else
+    {
+        mFrustum.FromViewProj(viewProj);
+
+        if (mUseOctree)
+        {
+            mOctree.Query(mFrustum, mVisibleObjects, mCullingStats);
+        }
+        else
+        {
+            for (uint32_t i = 0; i < kMassObjectCount; ++i)
+            {
+                mCullingStats.AabbTests++;
+                if (mFrustum.TestAABB(mMassBoxes[i]) != Frustum::Result::Outside)
+                    mVisibleObjects.push_back(i);
+            }
+        }
+    }
+
+    QueryPerformanceCounter(&end);
+    mCullingTimeMs = 1000.0f * (float)(end.QuadPart - start.QuadPart) / (float)mFreq.QuadPart;
+}
+
+// Два раза в секунду пишет в заголовок окна режим, число нарисованных объектов,
+// число проверок AABB, время отсечения и FPS
+void App::UpdateWindowTitle(float dt)
+{
+    mFpsFrames++;
+    mFpsTimer += dt;
+    if (mFpsTimer < 0.5f)
+        return;
+
+    float fps = (float)mFpsFrames / mFpsTimer;
+    mFpsFrames = 0;
+    mFpsTimer = 0.0f;
+
+    wchar_t title[512];
+    if (!mMassScene)
+    {
+        swprintf_s(title, L"Sponza | тесселяция %ls | FPS %.0f | V-Sync %ls | M - сцена с кубами",
+            mTessellationEnabled ? L"вкл" : L"выкл", fps, mVSync ? L"вкл" : L"выкл");
+    }
+    else
+    {
+        const wchar_t* mode = !mCullingEnabled ? L"выкл" : (mUseOctree ? L"фрустум + октодерево" : L"фрустум, перебор");
+        swprintf_s(title, L"Кубы | отсечение: %ls | рисуется %zu из %u | проверок AABB %u | отсечение %.3f мс | FPS %.0f | V-Sync %ls",
+            mode, mVisibleObjects.size(), kMassObjectCount, mCullingStats.AabbTests, mCullingTimeMs, fps, mVSync ? L"вкл" : L"выкл");
+    }
+    SetWindowTextW(mHwnd, title);
+}
+
 // Управление:
 //  WASD - движение, Q/E - вниз/вверх, Shift - быстрее
 //  стрелки - поворот камеры
@@ -1388,6 +1600,28 @@ void App::UpdateInput(float dt)
     bool keyF = IsDown('F');
     if (keyF && !mPrevKeyF) mWireframe = !mWireframe;
     mPrevKeyF = keyF;
+
+
+    // переключение сцены: Sponza со светом <-> кубы
+    bool keyM = IsDown('M');
+    if (keyM && !mPrevKeyM) mMassScene = !mMassScene;
+    mPrevKeyM = keyM;
+
+    // frustum culling вкл/выкл
+    bool keyC = IsDown('C');
+    if (keyC && !mPrevKeyC) mCullingEnabled = !mCullingEnabled;
+    mPrevKeyC = keyC;
+
+    // отсечение через октодерево или полным перебором
+    bool keyO = IsDown('O');
+    if (keyO && !mPrevKeyO) mUseOctree = !mUseOctree;
+    mPrevKeyO = keyO;
+
+    // вертикальная синхронизация вкл/выкл
+    bool keyV = IsDown('V');
+    if (keyV && !mPrevKeyV) mVSync = !mVSync;
+    mPrevKeyV = keyV;
+
 }
 
 // UPDATE - тут считаем камеру и обновляем константные буферы
@@ -1418,7 +1652,8 @@ void App::Update()
     passCB.TessMinDist = mTessMinDist;
     passCB.TessMaxDist = mTessMaxDist;
 
-    if (mTessellationEnabled)
+    // у кубов нет карт высот, тесселяция там только тратила бы время
+    if (mTessellationEnabled && !mMassScene)
     {
         passCB.TessMinFactor = mTessMinFactor;
         passCB.TessMaxFactor = mTessMaxFactor;
@@ -1461,13 +1696,19 @@ void App::Update()
 
         memcpy(mObjectCBData + i * mObjectCBElementSize, &objCB, sizeof(objCB));
     }
+
+
+    // отсечение считается по той же матрице, что уходит в шейдер, только не транспонированной
+    if (mMassScene)
+        UpdateCulling(view * proj);
+
+    UpdateWindowTitle(dt);
 }
 
 
-// DRAW - тут рисуем кадр: deferred rendering из двух проходов
+// DRAW - рисуем кадр: deferred rendering из двух проходов
 //   1) Geometry pass - заполняем G-buffer (без освещения)
 //   2) Lighting pass - для каждого источника света накапливаем освещение в бэк-буфере
-
 void App::Draw()
 {
     ThrowIfFailed(mCommandAllocator->Reset(), "CommandAllocator->Reset");
@@ -1479,48 +1720,66 @@ void App::Draw()
     mCommandList->RSSetViewports(1, &viewport);
     mCommandList->RSSetScissorRects(1, &scissor);
 
-    // подключаем кучу с текстурами / G-buffer SRV
+    // подключаем кучу с текстурами и SRV G-буфера
     ID3D12DescriptorHeap* heaps[] = { mSrvHeap.Get() };
     mCommandList->SetDescriptorHeaps(1, heaps);
 
     D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = mDsvHeap->GetCPUDescriptorHandleForHeapStart();
 
-    
-    // PASS 1: Geometry (opaque) - заполняем G-buffer (слайд 9, 17, 18)
-    // =================================================================================
+    // Geometry pass: заполняем G-buffer
     mRenderingSystem.BeginGeometryPass(mCommandList.Get(), dsvHandle);
 
-    // b1 - константы кадра (камера), общие для всех объектов
+    // b1 - константы кадра (камера и тесселяция), общие для всех объектов
     mCommandList->SetGraphicsRootConstantBufferView(1, mPassCB->GetGPUVirtualAddress());
 
     // топологию (патчи из 3 точек) уже выставил BeginGeometryPass, тут только буферы
-    mCommandList->IASetVertexBuffers(0, 1, &mVbv);
-    mCommandList->IASetIndexBuffer(&mIbv);
-
-    for (size_t i = 0; i < mModel.Submeshes.size(); ++i)
+    if (mMassScene)
     {
-        const Submesh& sm = mModel.Submeshes[i];
-        if (sm.IndexCount == 0)
-            continue;
+        // Сцена с копиями: геометрия основной Sponza, но без текстур, и своя мировая матрица у каждой копии.
+        // Материал у всех копий один, поэтому вся модель рисуется одним вызовом, без деления на сабмеши.
+        // Рисуем только копии из списка видимых, который собрал UpdateCulling
+        mCommandList->IASetVertexBuffers(0, 1, &mVbv);
+        mCommandList->IASetIndexBuffer(&mIbv);
 
-        const MaterialData& mat = mModel.Materials[sm.MaterialIndex >= 0 ? sm.MaterialIndex : 0];
+        // без текстур: таблица со слота 0 - это белая, плоская нормаль и чёрная
+        mCommandList->SetGraphicsRootDescriptorTable(2, mSrvHeap->GetGPUDescriptorHandleForHeapStart());
 
-        D3D12_GPU_VIRTUAL_ADDRESS objCbAddress = mObjectCB->GetGPUVirtualAddress() + i * mObjectCBElementSize;
-        mCommandList->SetGraphicsRootConstantBufferView(0, objCbAddress);
+        UINT indexCount = (UINT)mModel.Indices.size();
+        D3D12_GPU_VIRTUAL_ADDRESS cbStart = mMassObjectCB->GetGPUVirtualAddress();
+        for (uint32_t id : mVisibleObjects)
+        {
+            mCommandList->SetGraphicsRootConstantBufferView(0, cbStart + (UINT64)id * mObjectCBElementSize);
+            mCommandList->DrawIndexedInstanced(indexCount, 1, 0, 0, 0);
+        }
+    }
+    else
+    {
+        mCommandList->IASetVertexBuffers(0, 1, &mVbv);
+        mCommandList->IASetIndexBuffer(&mIbv);
 
-        D3D12_GPU_DESCRIPTOR_HANDLE srvHandle = mSrvHeap->GetGPUDescriptorHandleForHeapStart();
-        srvHandle.ptr += (SIZE_T)mat.SrvIndex * mSrvDescSize;
-        mCommandList->SetGraphicsRootDescriptorTable(2, srvHandle);
+        for (size_t i = 0; i < mModel.Submeshes.size(); ++i)
+        {
+            const Submesh& sm = mModel.Submeshes[i];
+            if (sm.IndexCount == 0)
+                continue;
 
-        mCommandList->DrawIndexedInstanced(sm.IndexCount, 1, sm.StartIndexLocation, 0, 0);
+            const MaterialData& mat = mModel.Materials[sm.MaterialIndex >= 0 ? sm.MaterialIndex : 0];
+
+            D3D12_GPU_VIRTUAL_ADDRESS objCbAddress = mObjectCB->GetGPUVirtualAddress() + i * mObjectCBElementSize;
+            mCommandList->SetGraphicsRootConstantBufferView(0, objCbAddress);
+
+            // таблица из 3 текстур материала: diffuse, normal, displacement
+            D3D12_GPU_DESCRIPTOR_HANDLE srvHandle = mSrvHeap->GetGPUDescriptorHandleForHeapStart();
+            srvHandle.ptr += (SIZE_T)mat.SrvIndex * mSrvDescSize;
+            mCommandList->SetGraphicsRootDescriptorTable(2, srvHandle);
+
+            mCommandList->DrawIndexedInstanced(sm.IndexCount, 1, sm.StartIndexLocation, 0, 0);
+        }
     }
 
     mRenderingSystem.EndGeometryPass(mCommandList.Get());
 
-    // =================================================================================
-    // PASS 2: Lighting - переводим бэк-буфер в render target, очищаем и
-    // накапливаем освещение от каждого источника света (слайды 11, 13, 21, 22)
-    // =================================================================================
+    // Lighting pass: переводим бэк-буфер в render target, очищаем и накапливаем освещение
     D3D12_RESOURCE_BARRIER toRT = {};
     toRT.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     toRT.Transition.pResource = mRenderTargets[mCurrentBackBuffer].Get();
@@ -1532,15 +1791,16 @@ void App::Draw()
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = mRtvHeap->GetCPUDescriptorHandleForHeapStart();
     rtvHandle.ptr += mCurrentBackBuffer * mRtvDescSize;
 
-    // очищаем бэк-буфер в чёрный - lighting pass будет складывать яркость сверху (слайд 13)
+    // очищаем бэк-буфер в чёрный, lighting pass будет складывать яркость сверху
     const float clearColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     mCommandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
 
-    // камера и матрица ViewProj нужны lighting pass'у для расчёта specular/затухания
+    // камера и матрица ViewProj нужны lighting pass'у для расчёта блика и затухания
     XMFLOAT4X4 viewProj;
     memcpy(&viewProj, mPassCBData, sizeof(XMFLOAT4X4)); // ViewProj лежит первым полем в PassConstants
 
-    mRenderingSystem.RenderLights(mCommandList.Get(), rtvHandle, mLights, viewProj, mCameraPos);
+    // в сцене с кубами свой набор света (только солнце), в Sponza - как раньше
+    mRenderingSystem.RenderLights(mCommandList.Get(), rtvHandle, mMassScene ? mMassLights : mLights, viewProj, mCameraPos);
 
     // переводим бэк-буфер обратно в состояние "готов к показу"
     D3D12_RESOURCE_BARRIER toPresent = {};
@@ -1556,7 +1816,8 @@ void App::Draw()
     ID3D12CommandList* lists[] = { mCommandList.Get() };
     mCommandQueue->ExecuteCommandLists(1, lists);
 
-    ThrowIfFailed(mSwapChain->Present(1, 0), "Present");
+    // 1 - ждать вертикальную синхронизацию, 0 - показывать сразу (FPS не ограничен частотой монитора)
+    ThrowIfFailed(mSwapChain->Present(mVSync ? 1 : 0, 0), "Present");
 
     FlushCommandQueue();
 
