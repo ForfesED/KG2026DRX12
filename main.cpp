@@ -21,6 +21,7 @@
 #include "Gbuffer.h"
 #include "RenderingSystem.h"
 #include "Culling.h"
+#include "ParticleSystem.h"
 
 // тут подключаем нужные библиотеки, чтобы линкер не ругался
 #pragma comment(lib, "d3d12.lib")
@@ -565,6 +566,9 @@ const UINT kShadowMapSize = 2048;        // размер одной карты (
 const float kShadowDistance = 3000.0f;   // до какой глубины от камеры есть тени, дальше всё освещено
 const float kCascadeLambda = 0.8f;       // 0 - каскады равной длины, 1 - чисто логарифмическое деление
 
+// Параметры системы частиц
+const UINT kMaxParticles = 65536;        // размер пула частиц
+
 // Раскладка SRV кучи:
 //  0, 1, 2 - текстуры по умолчанию: белая (diffuse), плоская нормаль, чёрная (нулевое смещение)
 //  3 и дальше - по 3 дескриптора на каждый материал (diffuse, normal, displacement)
@@ -572,6 +576,7 @@ const float kCascadeLambda = 0.8f;       // 0 - каскады равной дл
 const UINT kSrvHeapSize = 1024;
 const UINT kGBufferSrvSlot = kSrvHeapSize - GBuffer::kNumRenderTargets;
 const UINT kShadowMapSrvSlot = kGBufferSrvSlot - 1; // слот перед G-буфером - каскадная карта теней
+const UINT kParticleUavSlot = kShadowMapSrvSlot - 3; // 3 слота перед картой теней - UAV системы частиц
 const int kWhiteTexSlot = 0;
 const int kFlatNormalTexSlot = 1;
 const int kBlackTexSlot = 2;
@@ -743,6 +748,10 @@ private:
     bool mShowCascades = false;           // K - раскрасить пиксели по номеру каскада
     bool mPrevKeyP = false;
     bool mPrevKeyK = false;
+
+
+    // система частиц: симуляция в compute шейдерах, рисование в G-buffer
+    ParticleSystem mParticles;
 };
 
 
@@ -769,6 +778,15 @@ void App::Init(HWND hwnd)
         mSrvHeap.Get(), mSrvDescSize, kGBufferSrvSlot,
         kShadowMapSrvSlot, kShadowMapSize,
         DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_D24_UNORM_S8_UINT);
+
+
+    // частицы рисуются в тот же G-buffer, поэтому PSO частиц нужны его форматы
+    DXGI_FORMAT gbufferFormats[GBuffer::kNumRenderTargets];
+    for (UINT i = 0; i < GBuffer::kNumRenderTargets; ++i)
+        gbufferFormats[i] = GBuffer::GetFormat(i);
+
+    mParticles.Initialize(mDevice.Get(), mCommandList.Get(), mSrvHeap.Get(), mSrvDescSize, kParticleUavSlot,
+        kMaxParticles, gbufferFormats, GBuffer::kNumRenderTargets, DXGI_FORMAT_D24_UNORM_S8_UINT);
 
     SetupSceneLights();
 
@@ -1370,7 +1388,7 @@ void App::LoadModelAndTextures()
 
     for (auto& mat : mModel.Materials)
     {
-        if (nextSrvSlot + 3 > (int)kShadowMapSrvSlot)
+        if (nextSrvSlot + 3 > (int)kParticleUavSlot)
             throw std::runtime_error("Материалов слишком много, увеличь kSrvHeapSize");
 
         mat.SrvIndex = nextSrvSlot;
@@ -1611,15 +1629,16 @@ void App::UpdateWindowTitle(float dt)
     wchar_t title[512];
     if (!mMassScene)
     {
-        swprintf_s(title, L"Sponza | тесселяция %ls | тени: PCF %ls | FPS %.0f | V-Sync %ls | M - сцена с копиями",
-            mTessellationEnabled ? L"вкл" : L"выкл", mPcfEnabled ? L"вкл" : L"выкл", fps, mVSync ? L"вкл" : L"выкл");
+        swprintf_s(title, L"Sponza | тесселяция %ls | тени: PCF %ls | частиц %u | FPS %.0f | V-Sync %ls | M - сцена с копиями",
+            mTessellationEnabled ? L"вкл" : L"выкл", mPcfEnabled ? L"вкл" : L"выкл", mParticles.GetAliveCount(),
+            fps, mVSync ? L"вкл" : L"выкл");
     }
     else
     {
         const wchar_t* mode = !mCullingEnabled ? L"выкл" : (mUseOctree ? L"фрустум + октодерево" : L"фрустум, перебор");
-        swprintf_s(title, L"Копии Sponza | отсечение: %ls | рисуется %zu из %u | в тени %zu | проверок AABB %u | отсечение %.3f мс | PCF %ls | FPS %.0f | V-Sync %ls",
+        swprintf_s(title, L"Копии Sponza | отсечение: %ls | рисуется %zu из %u | в тени %zu | проверок AABB %u | отсечение %.3f мс | PCF %ls | частиц %u | FPS %.0f | V-Sync %ls",
             mode, mVisibleObjects.size(), kMassObjectCount, mShadowCasters.size(), mCullingStats.AabbTests, mCullingTimeMs,
-            mPcfEnabled ? L"вкл" : L"выкл", fps, mVSync ? L"вкл" : L"выкл");
+            mPcfEnabled ? L"вкл" : L"выкл", mParticles.GetAliveCount(), fps, mVSync ? L"вкл" : L"выкл");
     }
     SetWindowTextW(mHwnd, title);
 }
@@ -1737,6 +1756,10 @@ void App::Update()
     XMMATRIX view = XMMatrixLookToLH(eyePos, forward, up);
     XMMATRIX proj = XMMatrixPerspectiveFovLH(kCameraFovY, (float)mClientWidth / (float)mClientHeight, kCameraNear, kCameraFar);// дальность прорисовки
 
+
+    // частицы: сколько родить в этом кадре и камера для билбордов
+    mParticles.Update(dt, view, proj);
+
     PassConstants passCB = {};
     XMStoreFloat4x4(&passCB.ViewProj, XMMatrixTranspose(view * proj));
     passCB.EyePosW = mCameraPos;
@@ -1821,6 +1844,9 @@ void App::Draw()
     D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = mDsvHeap->GetCPUDescriptorHandleForHeapStart();
 
 
+    // Симуляция частиц в compute шейдерах. Идёт первой, чтобы к geometry pass частицы уже были на новых местах
+    mParticles.Simulate(mCommandList.Get());
+
     // Shadow pass: сцена с точки зрения солнца во все каскады карты теней.
     // Текстуры не нужны, только позиции, поэтому модель рисуется целиком одним вызовом, без деления на сабмеши
     mRenderingSystem.BeginShadowPass(mCommandList.Get());
@@ -1902,6 +1928,10 @@ void App::Draw()
             mCommandList->DrawIndexedInstanced(sm.IndexCount, 1, sm.StartIndexLocation, 0, 0);
         }
     }
+
+    // Непрозрачные частицы пишутся в тот же G-buffer, что и сцена, поэтому lighting pass
+// освещает их всеми источниками света и накладывает на них тени
+    mParticles.Render(mCommandList.Get());
 
     mRenderingSystem.EndGeometryPass(mCommandList.Get());
 

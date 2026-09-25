@@ -65,6 +65,7 @@
     <ClCompile Include="Culling.cpp" />
     <ClCompile Include="Gbuffer.cpp" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="ParticleSystem.cpp" />
     <ClCompile Include="RenderingSystem.cpp" />
     <ClCompile Include="ShadowMap.cpp" />
   </ItemGroup>
@@ -86,8 +87,14 @@
   <ItemGroup>
     <ClInclude Include="Culling.h" />
     <ClInclude Include="Gbuffer.h" />
+    <ClInclude Include="ParticleSystem.h" />
     <ClInclude Include="RenderingSystem.h" />
     <ClInclude Include="ShadowMap.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Particles.hlsl">
+      <FileType>Document</FileType>
+    </None>
   </ItemGroup>
   <Target Name="CopyAssets" AfterTargets="Build">
     <Copy SourceFiles="Shaders.hlsl" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
