@@ -22,6 +22,7 @@
 #include "RenderingSystem.h"
 #include "Culling.h"
 #include "ParticleSystem.h"
+#include "PostProcess.h"
 
 // тут подключаем нужные библиотеки, чтобы линкер не ругался
 #pragma comment(lib, "d3d12.lib")
@@ -572,11 +573,15 @@ const UINT kMaxParticles = 65536;        // размер пула частиц
 // Раскладка SRV кучи:
 //  0, 1, 2 - текстуры по умолчанию: белая (diffuse), плоская нормаль, чёрная (нулевое смещение)
 //  3 и дальше - по 3 дескриптора на каждый материал (diffuse, normal, displacement)
+//  3 слота перед UAV частиц - пост-обработка (картинка сцены и две текстуры bloom)
+//  3 слота перед картой теней - UAV системы частиц (пул, Dead List, Alive List)
+//  слот перед G-буфером - карта теней
 //  последние 3 слота - G-buffer для lighting pass
 const UINT kSrvHeapSize = 1024;
 const UINT kGBufferSrvSlot = kSrvHeapSize - GBuffer::kNumRenderTargets;
 const UINT kShadowMapSrvSlot = kGBufferSrvSlot - 1; // слот перед G-буфером - каскадная карта теней
 const UINT kParticleUavSlot = kShadowMapSrvSlot - 3; // 3 слота перед картой теней - UAV системы частиц
+const UINT kPostSrvSlot = kParticleUavSlot - PostProcess::kSrvCount; // 3 слота перед частицами - пост-обработка
 const int kWhiteTexSlot = 0;
 const int kFlatNormalTexSlot = 1;
 const int kBlackTexSlot = 2;
@@ -752,7 +757,17 @@ private:
 
     // система частиц: симуляция в compute шейдерах, рисование в G-buffer
     ParticleSystem mParticles;
+
+    // пост-обработка: bloom, хроматическая аберрация, просмотр G-буфера
+    PostProcess mPostProcess;
+    bool mBloomEnabled = false;   // B - свечение ярких мест
+    bool mChromaEnabled = false;  // N - хроматическая аберрация
+    UINT mViewMode = 0;           // G - 0 итог, 1 альбедо, 2 нормали, 3 позиции, 4 только свечение
+    bool mPrevKeyB = false;
+    bool mPrevKeyN = false;
+    bool mPrevKeyG = false;
 };
+
 
 
 void App::Init(HWND hwnd)
@@ -774,10 +789,16 @@ void App::Init(HWND hwnd)
     LoadModelAndTextures();
     CreateMassScene();
 
+    // lighting pass теперь рисует не в back buffer, а в HDR текстуру сцены пост-обработки,
+  // поэтому формат рендертаргета у него такой же, как у этой текстуры
     mRenderingSystem.Init(mDevice.Get(), mClientWidth, mClientHeight,
         mSrvHeap.Get(), mSrvDescSize, kGBufferSrvSlot,
         kShadowMapSrvSlot, kShadowMapSize,
-        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_D24_UNORM_S8_UINT);
+        PostProcess::kSceneFormat, DXGI_FORMAT_D24_UNORM_S8_UINT);
+
+    // итоговый проход пост-обработки пишет в back buffer, ему нужен формат back buffer
+    mPostProcess.Init(mDevice.Get(), mClientWidth, mClientHeight,
+        mSrvHeap.Get(), mSrvDescSize, kPostSrvSlot, DXGI_FORMAT_R8G8B8A8_UNORM);
 
 
     // частицы рисуются в тот же G-buffer, поэтому PSO частиц нужны его форматы
@@ -1388,7 +1409,7 @@ void App::LoadModelAndTextures()
 
     for (auto& mat : mModel.Materials)
     {
-        if (nextSrvSlot + 3 > (int)kParticleUavSlot)
+        if (nextSrvSlot + 3 > (int)kPostSrvSlot)
             throw std::runtime_error("Материалов слишком много, увеличь kSrvHeapSize");
 
         mat.SrvIndex = nextSrvSlot;
@@ -1633,6 +1654,7 @@ void App::UpdateWindowTitle(float dt)
             mTessellationEnabled ? L"вкл" : L"выкл", mPcfEnabled ? L"вкл" : L"выкл", mParticles.GetAliveCount(),
             fps, mVSync ? L"вкл" : L"выкл");
     }
+
     else
     {
         const wchar_t* mode = !mCullingEnabled ? L"выкл" : (mUseOctree ? L"фрустум + октодерево" : L"фрустум, перебор");
@@ -1640,6 +1662,15 @@ void App::UpdateWindowTitle(float dt)
             mode, mVisibleObjects.size(), kMassObjectCount, mShadowCasters.size(), mCullingStats.AabbTests, mCullingTimeMs,
             mPcfEnabled ? L"вкл" : L"выкл", mParticles.GetAliveCount(), fps, mVSync ? L"вкл" : L"выкл");
     }
+
+    // в конец заголовка дописываем состояние пост-обработки
+    static const wchar_t* viewNames[PostProcess::kViewModeCount] =
+    { L"итог", L"альбедо", L"нормали", L"позиции", L"свечение" };
+    wchar_t post[128];
+    swprintf_s(post, L" | B bloom %ls | N аберрация %ls | G показ: %ls",
+        mBloomEnabled ? L"вкл" : L"выкл", mChromaEnabled ? L"вкл" : L"выкл", viewNames[mViewMode]);
+    wcscat_s(title, post);
+
     SetWindowTextW(mHwnd, title);
 }
 
@@ -1649,6 +1680,7 @@ void App::UpdateWindowTitle(float dt)
 //  T - включить/выключить тесселяцию, F - каркасный режим
 //  P - PCF вкл/выкл: мягкий край тени или ступеньки
 //  K - 	раскрасить каскады: красный, зелёный, синий, жёлтый
+//  B - bloom вкл/выкл, N - хроматическая аберрация вкл/выкл, G - что показывать (итог / альбедо / нормали / позиции / свечение)
 void App::UpdateInput(float dt)
 {
     // клавиши читаем только когда окно активно, иначе камера будет ездить при наборе текста в другом окне
@@ -1732,7 +1764,23 @@ void App::UpdateInput(float dt)
     if (keyK && !mPrevKeyK) mShowCascades = !mShowCascades;
     mPrevKeyK = keyK;
 
+    // bloom вкл/выкл
+    bool keyB = IsDown('B');
+    if (keyB && !mPrevKeyB) mBloomEnabled = !mBloomEnabled;
+    mPrevKeyB = keyB;
+
+    // хроматическая аберрация вкл/выкл
+    bool keyN = IsDown('N');
+    if (keyN && !mPrevKeyN) mChromaEnabled = !mChromaEnabled;
+    mPrevKeyN = keyN;
+
+    // следующий режим просмотра, после последнего снова 0
+    bool keyG = IsDown('G');
+    if (keyG && !mPrevKeyG) mViewMode = (mViewMode + 1) % PostProcess::kViewModeCount;
+    mPrevKeyG = keyG;
 }
+
+
 
 // UPDATE - тут считаем камеру и обновляем константные буферы
 void App::Update()
@@ -1935,7 +1983,20 @@ void App::Draw()
 
     mRenderingSystem.EndGeometryPass(mCommandList.Get());
 
-    // Lighting pass: переводим бэк-буфер в render target, очищаем и накапливаем освещение
+    // Lighting pass: накапливаем освещение в HDR текстуре сцены (не в back buffer),
+// чтобы пост-обработка потом могла её читать и яркость больше 1 не обрезалась
+    mPostProcess.BeginScene(mCommandList.Get());
+
+    // камера и матрица ViewProj нужны lighting pass'у для расчёта блика и затухания
+    XMFLOAT4X4 viewProj;
+    memcpy(&viewProj, mPassCBData, sizeof(XMFLOAT4X4)); // ViewProj лежит первым полем в PassConstants
+
+    // в сцене с копиями свой набор света (только солнце), в Sponza - как раньше
+    mRenderingSystem.RenderLights(mCommandList.Get(), mPostProcess.GetSceneRtv(),
+        mMassScene ? mMassLights : mLights, viewProj, mCameraPos);
+
+    // Пост-обработка: переводим бэк-буфер в render target, и итоговый проход рисует в него.
+    // Очищать бэк-буфер не нужно, итоговый проход перезаписывает каждый пиксель
     D3D12_RESOURCE_BARRIER toRT = {};
     toRT.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     toRT.Transition.pResource = mRenderTargets[mCurrentBackBuffer].Get();
@@ -1947,16 +2008,8 @@ void App::Draw()
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = mRtvHeap->GetCPUDescriptorHandleForHeapStart();
     rtvHandle.ptr += mCurrentBackBuffer * mRtvDescSize;
 
-    // очищаем бэк-буфер в чёрный, lighting pass будет складывать яркость сверху
-    const float clearColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-    mCommandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
-
-    // камера и матрица ViewProj нужны lighting pass'у для расчёта блика и затухания
-    XMFLOAT4X4 viewProj;
-    memcpy(&viewProj, mPassCBData, sizeof(XMFLOAT4X4)); // ViewProj лежит первым полем в PassConstants
-
-    // в сцене с кубами свой набор света (только солнце), в Sponza - как раньше
-    mRenderingSystem.RenderLights(mCommandList.Get(), rtvHandle, mMassScene ? mMassLights : mLights, viewProj, mCameraPos);
+    mPostProcess.Render(mCommandList.Get(), rtvHandle, mRenderingSystem.GetGBuffer().GetSrvGpuHandle(),
+        mBloomEnabled, mChromaEnabled, mViewMode);
 
     // переводим бэк-буфер обратно в состояние "готов к показу"
     D3D12_RESOURCE_BARRIER toPresent = {};

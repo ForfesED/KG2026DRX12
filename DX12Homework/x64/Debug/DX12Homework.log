@@ -1,4 +1,9 @@
-﻿  main.cpp
+﻿  Culling.cpp
+  Gbuffer.cpp
+  main.cpp
   ParticleSystem.cpp
+  PostProcess.cpp
+  RenderingSystem.cpp
+  ShadowMap.cpp
   Создание кода...
-  DX12Homework.vcxproj -> C:\Users\andre\OneDrive\Desktop\DRX12KG\x64\Debug\DX12Homework.exe
+  DX12Homework.vcxproj -> C:\Users\andre\OneDrive\Desktop\DRX12KG\KG(PUBLIC)\KG2026DRX12\x64\Debug\DX12Homework.exe
